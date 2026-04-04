@@ -9,3 +9,4 @@ build/
 .cache/
 *.egg
 .claude/
+.DS_Store
