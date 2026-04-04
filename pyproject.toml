@@ -1,0 +1,20 @@
+[project]
+name = "mtg-commander-mcp"
+version = "0.1.0"
+description = "MCP server for Magic: The Gathering Commander/EDH - EDHRec, Scryfall, Archidekt, Moxfield, and MTG Rules"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+    "cloudscraper>=1.2.71",
+]
+
+[project.scripts]
+mtg-commander-mcp = "mtg_commander_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
