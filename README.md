@@ -55,17 +55,20 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "mtg-commander": {
-      "command": "uv",
+      "command": "/absolute/path/to/uv",
       "args": [
         "run",
         "--directory",
         "/path/to/mtg-commander-MCP",
+        "--no-editable",
         "mtg-commander-mcp"
       ]
     }
   }
 }
 ```
+
+Use the absolute path to `uv` (find it with `which uv`) — Claude Desktop doesn't inherit your shell `PATH`. The `--no-editable` flag sidesteps a `ModuleNotFoundError` caused by editable-install `.pth` files under Python 3.14.
 
 Restart Claude Desktop to pick up the new server.
 
@@ -82,12 +85,18 @@ Add to your Claude Code settings or `.claude/settings.json`:
         "run",
         "--directory",
         "/path/to/mtg-commander-MCP",
+        "--no-editable",
         "mtg-commander-mcp"
       ]
     }
   }
 }
 ```
+
+## Troubleshooting
+
+- **`ModuleNotFoundError: No module named 'mtg_commander_mcp'`** — make sure `--no-editable` is in your args (see above). Python 3.14 breaks editable installs that rely on `.pth` files.
+- **`Operation not permitted` when launching** — if your config invokes a shell-script wrapper (e.g. `run.sh`) that lives inside `~/Documents`, macOS TCC will block the sandboxed Claude Desktop from executing it. Use the `uv run` command directly as shown above, or move the repo outside `~/Documents` (e.g. `~/src/`).
 
 ## Testing
 
