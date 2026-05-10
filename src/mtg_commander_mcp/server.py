@@ -1503,6 +1503,7 @@ async def pull_and_buy_lists(
     archidekt_username: str | None = None,
     include_basics: bool = False,
     cheapest_printing: bool = False,
+    include_over_commit_warnings: bool = False,
 ) -> dict:
     """Cross-reference your collection × existing decks × a new deck,
     printing-aware on both inventory and deck slots.
@@ -1538,9 +1539,16 @@ async def pull_and_buy_lists(
         printing was found.
       - `buy_list_source_breakdown`: `{mtgjson, scryfall, missing}`
         counts showing which backend priced each card.
-      - `over_commit_warnings`: [{name, requested, owned,
-        committed_other_decks}] — name-level signal that the new deck
-        wants a card you've already over-allocated.
+      - `over_commit_warnings_count`: integer count of cards that
+        appear in more existing decks than you own copies of. Always
+        present.
+      - `over_commit_warnings`: full list of `[{name, requested,
+        owned, committed_other_decks}]` — only present when
+        ``include_over_commit_warnings=True``. Suppressed by default
+        because a 60+ deck portfolio routinely shows 40-60 entries,
+        which is informational noise rather than actionable for a
+        specific new-deck build. For dedicated allocation analysis
+        use ``compute_card_allocation`` directly.
       - `decks_considered`: [{name, url}] — existing decks that
         actually contributed (the new deck's own URL is excluded if
         Archidekt auto-discovery surfaced it).
@@ -1569,6 +1577,10 @@ async def pull_and_buy_lists(
         archidekt_username: optional, auto-include user's Commander decks
         include_basics: include basic lands in the buy list (default False)
         cheapest_printing: opt into cheapest-printing search (default False)
+        include_over_commit_warnings: surface the full over-commit
+            warnings list inline. Default False — only the
+            ``over_commit_warnings_count`` is reported so the caller
+            knows whether any exist without paying for the noise.
     """
     rows, err = _load_active()
     if err:
@@ -1637,7 +1649,7 @@ async def pull_and_buy_lists(
         allocation["buy_list"], cheapest_printing=cheapest_printing
     )
 
-    return {
+    response: dict = {
         "new_deck": new_deck_meta,
         "decks_considered": [
             {"name": d.get("name"), "url": d.get("__url")} for d in existing_decks
@@ -1654,8 +1666,15 @@ async def pull_and_buy_lists(
         "buy_list_total_usd": pricing["total_usd"],
         "buy_list_missing_prices": pricing["missing"],
         "buy_list_source_breakdown": pricing.get("source_breakdown"),
-        "over_commit_warnings": allocation["over_commit_warnings"],
+        # Always surface the count so the caller knows whether any
+        # warnings exist; the full list is opt-in to avoid drowning
+        # a typical 60+ deck portfolio's response in informational
+        # entries that don't affect the current pull/buy decision.
+        "over_commit_warnings_count": len(allocation["over_commit_warnings"]),
     }
+    if include_over_commit_warnings:
+        response["over_commit_warnings"] = allocation["over_commit_warnings"]
+    return response
 
 
 def _set_density(cards: list[dict]) -> list[dict]:

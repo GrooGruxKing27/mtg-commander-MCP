@@ -5,7 +5,7 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
-## [0.4.1] — 2026-05-10 — set-density shopping path on `pull_and_buy_lists`
+## [0.4.1] — 2026-05-10 — UX polish on `pull_and_buy_lists`
 
 ### Added
 - **`pull_list_set_density`** and **`buy_list_set_density`** fields
@@ -16,17 +16,38 @@ All notable changes to this project. Format loosely follows
   in-order. Turns a 39-card pull list across 22 sets into an
   ordered shopping path — hit the densest physical locations
   first, minimize binder/box traversal. Empirically: top 4 sets
-  on the reported Muddle workload account for 44% of the pull,
-  so the buckets are real and the ordering matters.
+  on the reported Muddle workload account for 44% of the pull;
+  for the buy list, 45% (21/47) of cards are from a single set
+  (SOC) — a hint to consolidate the TCGplayer order with a
+  SOC-heavy seller.
 - **`pull_list_total_count`** and **`buy_list_total_count`** —
   convenience integer fields summing `quantity` across each list.
   Saves the caller a `sum(c["quantity"] for c in ...)`.
+- **`over_commit_warnings_count`** — always-present integer count
+  of cards that appear in more existing decks than you own copies
+  of. Lets the caller see at-a-glance whether any portfolio-level
+  conflicts exist without having to count an array.
+
+### Changed
+- **`over_commit_warnings` is now opt-in.** Default behavior
+  suppresses the full list (a 60+ deck portfolio routinely shows
+  40-60 entries — informational noise for the current new-deck
+  decision). Pass `include_over_commit_warnings=True` to
+  `pull_and_buy_lists` to surface them inline. For dedicated
+  allocation analysis, use `compute_card_allocation` directly —
+  that tool's whole point is the allocation report and continues
+  to return `over_committed` in full.
 
 ### Notes
 - Purely additive on the response object — no allocator or pricer
-  changes, no new I/O, no schema removal.
+  changes, no new I/O.
 - Cards without a `set_code` (rare, parser-edge cases) land in an
   `"unknown"` bucket rather than being dropped silently.
+- **Minor breaking change**: the `over_commit_warnings` field is
+  no longer present by default. Callers that relied on it must
+  pass `include_over_commit_warnings=True` or switch to
+  `compute_card_allocation`. The `over_commit_warnings_count`
+  field is always present so the caller can branch on it.
 
 ## [0.4.0] — 2026-05-10 — MTGJSON-backed local pricing
 
