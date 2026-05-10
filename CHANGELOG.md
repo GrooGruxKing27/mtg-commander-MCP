@@ -5,6 +5,50 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-10 — fix `pull_and_buy_lists` MCP timeout
+
+### Fixed
+- **`pull_and_buy_lists` MCP timeout for ~50+ card cold buy lists.**
+  Empirical timing on the reported failing call (49-card cold buy
+  list against `GrooGruxKing27`'s collection) showed
+  `/cards/search?unique=prints` getting soft-throttled by Scryfall
+  at sustained concurrent load — 8 of 49 calls hung at ~60s each
+  regardless of whether we ran serial, Semaphore(8), or
+  Semaphore(4). The 100ms client-side throttle and the `_throttle`
+  lock can't avoid this; it's a server-side response-deferral
+  pattern.
+
+  Default pricing path now uses the **batched
+  `/cards/collection`** endpoint (75 names per POST, fuzzy fallback
+  for misses) — the same flow `price_deck` and v0.3.0's
+  `_price_buy_list` used. Cold 49-card buy list drops from
+  timing-out at >60s to ~3-7s. Trade-off: the price returned is
+  Scryfall's *default* printing, not the actually-cheapest. Most
+  cards' default is at or near the cheapest; edge-cases (foil-
+  precon-cheaper-than-nonfoil-promo) are no longer caught
+  automatically.
+
+  **Cheapest-printing search is preserved as opt-in** via
+  `cheapest_printing=True` on `pull_and_buy_lists`. Documented to
+  be slow and may time out on cold caches; for users who care
+  about the edge cases.
+- **Version drift between `__init__.py` and `pyproject.toml`.**
+  `pyproject.toml` was bumped to 0.3.1 in commit `1507a8f`;
+  `__init__.py` was missed and stayed at 0.3.0. Both now at 0.3.2.
+
+### Diagnostic data
+Cold-cache timing on the reported workload (49-card buy list,
+`https://archidekt.com/decks/22444881/muddle` ×
+`GrooGruxKing27`):
+
+| Mode | Wall-clock | Coverage | Notes |
+|------|-----------|----------|-------|
+| Pre-fix serial cheapest | ~125s | 100% | over MCP timeout |
+| Sem(8) cheapest | ~125s | 100% | Scryfall soft-throttles 8 of 49 |
+| Sem(4) cheapest | ~125s | 100% | same — concurrency isn't the bottleneck |
+| Default-printing batch (this fix) | ~5s | 100% | shipping default |
+| Default + warm cache | <0.5s | 100% | unchanged |
+
 ## [0.3.0] — 2026-05-10 — Delver Lens collection support
 
 Adds personal-collection workflows on top of the existing deck tools:

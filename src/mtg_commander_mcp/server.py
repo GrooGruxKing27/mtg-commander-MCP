@@ -1204,38 +1204,149 @@ def _serialize_printing_inv(
     return rows
 
 
-async def _price_buy_list(buy_list: list[dict]) -> dict:
-    """Price a buy list using the cheapest English-paper printing per card.
+async def _price_buy_list(
+    buy_list: list[dict], *, cheapest_printing: bool = False
+) -> dict:
+    """Price a buy list. Two modes:
 
-    Each input entry has ``{name, quantity, [set_code,
-    collector_number, scryfall_id]}`` — the optional fields describe
-    what the deck originally requested. The priced output row OVERRIDES
-    those with the cheapest printing's info so the user can buy the
-    cheap copy, not whatever variant the deck list happened to call
-    for.
+    * **Fast (default).** Batched ``/cards/collection`` lookup (75
+      names per POST) → 1-2 Scryfall round-trips for any reasonable
+      buy list, fuzzy-fallback for misses. Returns Scryfall's default
+      printing's price for each card. ~3-7s wall-clock cold.
+    * **Cheapest (opt-in via ``cheapest_printing=True``).** One
+      ``/cards/search?unique=prints`` per unique name with a
+      Semaphore(4) fan-out. Returns the actually-cheapest English
+      paper printing (foil or nonfoil, whichever is cheaper).
+      30-100s+ cold for ~50-card lists — Scryfall's search endpoint
+      soft-throttles concurrent requests in a way the 100ms client
+      throttle can't avoid. Will time out under MCP's 60s window
+      for big buy lists; documented for opt-in use only.
 
-    Latency-wise this is one Scryfall ``/cards/search`` per unique
-    name with a 4-way semaphore + 100ms global throttle — call it
-    ~250ms per name, with 429 backoff adding noise. A 100-card buy
-    list completes in ~30s on a cold cache.
+    Output schema is identical across modes — every priced row has
+    ``set_code``, ``set_name``, ``collector_number``, ``scryfall_id``,
+    ``finish``, ``unit_price_usd``, ``line_total_usd``. In fast mode
+    finish defaults to ``"nonfoil"``.
+
+    The default mode reverses the v0.3.1 design (always-cheapest)
+    after empirical timing showed cheapest mode can't fit in the
+    MCP request budget on cold caches. Cheapest is preserved as
+    opt-in for users who care about edge-case printings (foil
+    precon commanders being cheaper than nonfoil promos, etc.).
     """
     if not buy_list:
         return {"items": [], "total_usd": 0.0, "missing": []}
 
-    unique_names = list({c["name"] for c in buy_list})
+    if cheapest_printing:
+        return await _price_buy_list_cheapest(buy_list)
+    return await _price_buy_list_fast(buy_list)
 
-    # Serial lookup. The Scryfall client's global 100ms throttle already
-    # forces serialization between requests; concurrent fan-out just
-    # piles up 429s without buying any wall-clock — empirically ~48% of
-    # cards lost prices with a semaphore of 4. Serial @ ~250ms/card
-    # handles a 100-card buy list in ~25s, well under the MCP timeout.
-    cheapest_by_name: dict[str, dict | None] = {}
-    for name in unique_names:
-        try:
-            cheapest_by_name[name] = await scryfall.get_cheapest_printing(name)
-        except ScryfallError as e:
-            logger.warning("Cheapest-printing lookup failed for %r: %s", name, e)
-            cheapest_by_name[name] = None
+
+async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
+    """Default-printing pricing via batched ``/cards/collection``.
+
+    Mirrors the v0.3.0 flow (and ``price_deck``'s resolve-then-fallback
+    pattern at server.py:670) — exact-match batched lookup, then
+    per-card fuzzy fallback for the not-found list and for cards
+    whose default printing carries no USD price.
+    """
+    names = list({c["name"] for c in buy_list})
+    try:
+        scryfall_data, not_found = await scryfall.get_collection(names)
+    except ScryfallError as e:
+        return {"items": [], "total_usd": 0.0, "missing": names, "error": str(e)}
+
+    needs_fallback: list[str] = list(not_found)
+    fallback_set = set(needs_fallback)
+    for name in names:
+        sd = scryfall_data.get(name)
+        if sd is None or not (sd.get("prices") or {}).get("usd"):
+            if name not in fallback_set:
+                needs_fallback.append(name)
+                fallback_set.add(name)
+
+    if needs_fallback:
+        sem = asyncio.Semaphore(4)
+
+        async def _one(n: str):
+            async with sem:
+                try:
+                    return n, await scryfall.get_card_price(n)
+                except ScryfallError as e:
+                    return n, e
+
+        for name, fb in await asyncio.gather(*(_one(n) for n in needs_fallback)):
+            if isinstance(fb, ScryfallError):
+                continue
+            scryfall_data[name] = fb
+
+    total = 0.0
+    items: list[dict] = []
+    missing: list[str] = []
+    for entry in buy_list:
+        name = entry["name"]
+        qty = int(entry["quantity"])
+        sd = scryfall_data.get(name) or {}
+        usd = (sd.get("prices") or {}).get("usd")
+        if usd:
+            unit = float(usd)
+            line = round(unit * qty, 2)
+            total += line
+            items.append(
+                {
+                    "name": name,
+                    "quantity": qty,
+                    "set_code": sd.get("set"),
+                    "set_name": sd.get("set_name"),
+                    "collector_number": sd.get("collector_number"),
+                    "scryfall_id": sd.get("id"),
+                    "finish": "nonfoil",
+                    "unit_price_usd": round(unit, 2),
+                    "line_total_usd": line,
+                }
+            )
+        else:
+            missing.append(name)
+            items.append(
+                {
+                    "name": name,
+                    "quantity": qty,
+                    "set_code": entry.get("set_code"),
+                    "collector_number": entry.get("collector_number"),
+                    "scryfall_id": entry.get("scryfall_id"),
+                    "unit_price_usd": None,
+                    "line_total_usd": None,
+                }
+            )
+
+    return {
+        "items": items,
+        "total_usd": round(total, 2),
+        "missing": missing,
+    }
+
+
+async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
+    """Cheapest English-paper printing per card.
+
+    Slow path (one ``/cards/search?unique=prints`` per name with
+    Semaphore(4)). For users who want the actually-cheapest
+    printing instead of Scryfall's default. May exceed the MCP
+    60s timeout on ~50+ card cold runs — see the dispatcher
+    docstring above for the trade-off.
+    """
+    unique_names = list({c["name"] for c in buy_list})
+    sem = asyncio.Semaphore(4)
+
+    async def _lookup_one(name: str) -> tuple[str, dict | None]:
+        async with sem:
+            try:
+                return name, await scryfall.get_cheapest_printing(name)
+            except ScryfallError as e:
+                logger.warning("Cheapest-printing lookup failed for %r: %s", name, e)
+                return name, None
+
+    results = await asyncio.gather(*(_lookup_one(n) for n in unique_names))
+    cheapest_by_name: dict[str, dict | None] = dict(results)
 
     total = 0.0
     items: list[dict] = []
@@ -1288,6 +1399,7 @@ async def pull_and_buy_lists(
     deck_urls: list[str] | None = None,
     archidekt_username: str | None = None,
     include_basics: bool = False,
+    cheapest_printing: bool = False,
 ) -> dict:
     """Cross-reference your collection × existing decks × a new deck,
     printing-aware on both inventory and deck slots.
@@ -1305,9 +1417,8 @@ async def pull_and_buy_lists(
         (copies not already committed to other decks).
       - `buy_list`: [{name, set_code, set_name, collector_number,
         scryfall_id, finish, quantity, unit_price_usd, line_total_usd}]
-        — cards the new deck needs that aren't in the free pool,
-        priced at the cheapest English paper printing (foil or nonfoil,
-        whichever is cheaper).
+        — cards the new deck needs that aren't in the free pool, with
+        TCGPlayer USD pricing.
       - `buy_list_total_usd`: sum of `line_total_usd` across the buy
         list.
       - `buy_list_missing_prices`: names where no priced English paper
@@ -1326,11 +1437,23 @@ async def pull_and_buy_lists(
     ``match_tier="name"``. Basic lands are skipped by default — most
     Delver users don't track them. Set `include_basics=True` if you do.
 
+    Pricing modes:
+      * ``cheapest_printing=False`` (default) — Scryfall's default
+        printing per card via batched ``/cards/collection`` (75
+        names/POST). ~3-7s wall-clock for any reasonable buy list,
+        comfortably under MCP timeout.
+      * ``cheapest_printing=True`` — actually-cheapest English paper
+        printing (foil or nonfoil, whichever is cheaper) via
+        ``/cards/search?unique=prints``. May time out under the MCP
+        60s budget for ~50+ card cold buy lists; opt-in for users
+        who care about edge-case printing economics.
+
     Args:
         new_deck: deck URL or pasted decklist
         deck_urls: list of existing-deck URLs (Archidekt/Moxfield)
         archidekt_username: optional, auto-include user's Commander decks
         include_basics: include basic lands in the buy list (default False)
+        cheapest_printing: opt into cheapest-printing search (default False)
     """
     rows, err = _load_active()
     if err:
@@ -1395,7 +1518,9 @@ async def pull_and_buy_lists(
         include_basics=include_basics,
     )
 
-    pricing = await _price_buy_list(allocation["buy_list"])
+    pricing = await _price_buy_list(
+        allocation["buy_list"], cheapest_printing=cheapest_printing
+    )
 
     return {
         "new_deck": new_deck_meta,
