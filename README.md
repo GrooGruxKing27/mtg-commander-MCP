@@ -32,7 +32,7 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 - **`build_deck`** - Build a full 100-card Commander deck from a card name. Supports budget tiers and theme filtering. If the card isn't a commander, suggests commanders that use it.
 
 ### Pricing
-- **`price_deck`** - Price a deck from Archidekt/Moxfield on both TCGPlayer and Card Kingdom. Compares total cost and card availability with a recommendation.
+- **`price_deck`** - Price a deck from Archidekt/Moxfield on both TCGPlayer and Card Kingdom. Compares total cost and card availability with a recommendation. Uses Scryfall's batched `/cards/collection` endpoint plus 8-way concurrent EDHRec lookups, so a 100-card deck typically prices in ~10–20 s (down from 2–3 minutes in earlier versions). Caveat: the burst can briefly trip Scryfall's per-IP rate limiter, so other Scryfall-backed tools (`scryfall_card`, `scryfall_search`, `scryfall_rulings`) called within ~60 s of `price_deck` may return `"Scryfall rate limit exceeded after retries"` — wait a minute and retry.
 
 ### Rules
 - **`mtg_rules`** - Search the MTG Comprehensive Rules by keyword or rule number. Covers 3,100+ rules and 730+ glossary entries. Auto-updates when Wizards publishes new rules.
