@@ -129,3 +129,7 @@ Five-color: `five-color`
 - `mcp[cli]` - Model Context Protocol SDK
 - `httpx` - Async HTTP client
 - `cloudscraper` - Cloudflare bypass for Moxfield
+
+## License
+
+[MIT](LICENSE). See also [`CHANGELOG.md`](CHANGELOG.md) for release notes.
