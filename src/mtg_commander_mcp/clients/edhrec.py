@@ -250,16 +250,19 @@ class EDHRecClient:
                     })
                 break
 
-        # Similar cards (at top level, has prices)
-        similar = data.get("similar", [])
-        similar_cards = [
-            {
-                "name": s.get("name"),
-                "prices": s.get("prices"),
-                "primary_type": s.get("primary_type"),
-            }
-            for s in similar[:10]
-        ]
+        # Similar cards (at top level). EDHRec returns this as either a list
+        # of strings (card names) or a list of dicts depending on the page;
+        # normalize both shapes.
+        similar_cards = []
+        for s in data.get("similar", [])[:10]:
+            if isinstance(s, dict):
+                similar_cards.append({
+                    "name": s.get("name"),
+                    "prices": s.get("prices"),
+                    "primary_type": s.get("primary_type"),
+                })
+            elif isinstance(s, str):
+                similar_cards.append({"name": s, "prices": None, "primary_type": None})
 
         return {
             **card_info,

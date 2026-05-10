@@ -576,11 +576,17 @@ async def price_deck(url: str) -> dict:
     except (ArchidektError, MoxfieldError) as e:
         return {"error": str(e)}
 
-    # Collect all unique card names
+    # Collect unique cards. Archidekt assigns each card to one or more
+    # categories, so the same card appears multiple times in deck["categories"];
+    # dedupe by name to avoid double-counting price.
+    seen_names: set[str] = set()
     all_cards = []
     for cards in deck.get("categories", {}).values():
         for card in cards:
-            all_cards.append(card)
+            name = card.get("name")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                all_cards.append(card)
 
     tcg_total = 0.0
     ck_total = 0.0
