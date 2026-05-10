@@ -5,6 +5,80 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-10 — Delver Lens collection support
+
+Adds personal-collection workflows on top of the existing deck tools:
+import a Delver Lens CSV export, then cross-reference your collection
+against every deck you've already built to see what's free to use, what
+you'd need to buy for a new build, and which cards you've already
+double-booked across decks.
+
+### Added
+- **`import_collection`** — parse a Delver Lens CSV export (or any
+  compatible Moxfield / TCGPlayer / Deckbox / MTGstand preset).
+  Accepts a local file path, http(s):// URL, or pasted CSV text.
+  Auto-detects column variants via a case-insensitive alias table:
+  Name / Card Name / Card, Quantity / Count / Qty, Set Code / Edition,
+  Foil / Printing / Finish, Scryfall ID, etc. Resolves names via
+  Scryfall — exact-match batch lookup, then per-card fuzzy fallback
+  for the not-found list (same edge cases `price_deck` handles:
+  apostrophes, accents, casing). Returns counts + estimated USD value
+  + an `unresolved` list. With `persist=True`, writes a JSON snapshot
+  to `~/.local/share/mtg-commander-mcp/collection.json` (or
+  `$XDG_DATA_HOME/...`).
+- **`collection_summary`** — stats on the active collection: unique
+  cards, total quantity, estimated USD value, color identity
+  breakdown, top sets.
+- **`compute_card_allocation`** — given a list of Archidekt/Moxfield
+  deck URLs (and/or an Archidekt username for auto-discovery),
+  returns what's `committed` to existing decks, what's `free`, and
+  what's `over_committed` (used in more decks than owned).
+- **`pull_and_buy_lists`** — headline workflow tool. Given a new deck
+  (URL or pasted `1 Sol Ring`-style decklist) and the user's existing
+  deck set, returns a **pull list** (cards to physically pull from
+  the free pool of the collection), a priced **buy list** (TCGPlayer
+  USD via Scryfall), and over-commit warnings. Basic lands skipped
+  by default since most Delver users don't track them.
+- **`ArchidektClient.list_user_decks`** — paginated public deck
+  enumeration via `/api/decks/v3/?ownerUsername=<user>&ownerexact=true`
+  (verified against the live API; the obvious-looking
+  `/api/decks/cards/?owner=` route returns the React-server's
+  "Client Unavailable" stub). Defaults to **all formats** so a
+  user's Modern / Legacy / Pauper decks count as committed cards
+  alongside their Commander decks — physical cards are physical.
+  Optional `format_filter` accepts human names (`"commander"`,
+  `"modern"`, etc.) and translates to Archidekt's numeric
+  `deckFormat` codes. Pagination follows the API's `next` cursor
+  with a default cap of 20 pages (~1200 decks at the API's actual
+  ~60-per-page rate, despite `pageSize=50` being requested).
+  Skips `private` and `unlisted` decks (the latter is opt-in via
+  `include_unlisted=True`).
+- **`DelverClient`** — pure CSV parser; no network I/O beyond URL
+  fetch. ~150 LOC, no new third-party deps (`csv` is stdlib).
+- **`collection.py`** — quantity-aware allocation math
+  (`aggregate_owned`, `aggregate_committed`, `free_pool`,
+  `pull_and_buy`) + a tolerant decklist parser for pasted
+  `1 Sol Ring (CMM) 423` lines.
+- **`storage.py`** — atomic JSON snapshot at the XDG data dir, ~50 LOC.
+
+### Decisions
+- **No screen-scraping `mtg.delver.dev/collection`.** It's a Firebase-
+  authed SPA — fetching the URL returns only a copyright stub. CSV
+  export is the documented, stable integration surface.
+- **`.dlens` (SQLite) backup import deferred.** Schema is community-
+  reverse-engineered and shifts between Delver releases; CSV covers
+  ~100% of users.
+- **Single active collection** (no named/multiple collections).
+- **Allocation aggregates by Scryfall-canonical name**, not by
+  printing. Two `Sol Ring`s in different sets count as 2 against deck
+  demand. Foil/non-foil is preserved in the parsed rows but doesn't
+  affect allocation.
+
+### Changed
+- **`__version__` bumped to 0.3.0** in `__init__.py` and `pyproject.toml`.
+- **Tool count: 13 → 17.** README data-sources table now lists Delver
+  Lens as the 6th source.
+
 ## [0.2.1] — 2026-05-10 — second-pass cleanup
 
 Addresses the seven-item punch list from the v0.2.0 re-review.

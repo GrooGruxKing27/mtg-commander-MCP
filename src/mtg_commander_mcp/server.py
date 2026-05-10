@@ -11,6 +11,9 @@ from mtg_commander_mcp.clients.scryfall import ScryfallClient, ScryfallError
 from mtg_commander_mcp.clients.archidekt import ArchidektClient, ArchidektError
 from mtg_commander_mcp.clients.moxfield import MoxfieldClient, MoxfieldError
 from mtg_commander_mcp.clients.rules import RulesClient, RulesError
+from mtg_commander_mcp.clients.delver import DelverClient, DelverError
+from mtg_commander_mcp import collection as col_lib
+from mtg_commander_mcp import storage
 
 mcp = FastMCP("MTG Commander")
 
@@ -19,6 +22,7 @@ scryfall = ScryfallClient()
 archidekt = ArchidektClient()
 moxfield = MoxfieldClient()
 rules = RulesClient()
+delver = DelverClient()
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +826,494 @@ async def price_deck(url: str) -> dict:
         },
         "recommendation": f"{recommendation} ({reason})",
         "card_prices": card_prices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Collection Tools (Delver Lens)
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_rows(rows: list[dict]) -> tuple[list[dict], dict, list[dict]]:
+    """Run a parsed Delver CSV through Scryfall to canonicalize names
+    and capture pricing data.
+
+    Returns ``(resolved_rows, scryfall_by_name, unresolved)``.
+
+    Resolution preference:
+      1. exact-match batch lookup via /cards/collection (75 names/req)
+      2. fuzzy fallback for the not_found list (apostrophes, accents,
+         alternate printings — same edge cases price_deck handles)
+      3. anything still unresolved goes into ``unresolved`` and is
+         excluded from owned-counts.
+    """
+    if not rows:
+        return [], {}, []
+
+    names = list({r["name"] for r in rows if r.get("name")})
+    try:
+        scryfall_data, not_found = await scryfall.get_collection(names)
+    except ScryfallError as e:
+        logger.warning("Scryfall batch resolve failed: %s", e)
+        return [], {}, [{"row": r, "reason": str(e)} for r in rows]
+
+    # Per-card fuzzy fallback for misses. Bounded fan-out (matches
+    # price_deck's pattern at server.py:752) so a heavily-misspelled
+    # CSV doesn't burst Scryfall's per-IP limiter.
+    if not_found:
+        sem = asyncio.Semaphore(4)
+
+        async def _one(n: str):
+            async with sem:
+                try:
+                    return n, await scryfall.get_card_price(n)
+                except ScryfallError as e:
+                    return n, e
+
+        for name, result in await asyncio.gather(*(_one(n) for n in not_found)):
+            if isinstance(result, ScryfallError):
+                continue
+            # get_card_price returns {name, prices, purchase_uris} — close
+            # enough to a Scryfall card dict for our value-summing purposes.
+            scryfall_data[name] = result
+
+    resolved: list[dict] = []
+    unresolved: list[dict] = []
+    for r in rows:
+        name = r.get("name")
+        if name in scryfall_data:
+            # Use Scryfall's canonical name (handles "Jotun" -> "Jötun" etc.).
+            canonical = scryfall_data[name].get("name") or name
+            resolved.append({**r, "name": canonical})
+        else:
+            unresolved.append(r)
+
+    return resolved, scryfall_data, unresolved
+
+
+def _sum_collection_value(rows: list[dict], scryfall_data: dict) -> float:
+    total = 0.0
+    for r in rows:
+        sd = scryfall_data.get(r["name"])
+        if not sd:
+            continue
+        usd = (sd.get("prices") or {}).get("usd")
+        if not usd:
+            continue
+        try:
+            total += float(usd) * int(r.get("quantity", 1))
+        except (TypeError, ValueError):
+            continue
+    return round(total, 2)
+
+
+def _color_breakdown(rows: list[dict], scryfall_data: dict) -> dict[str, int]:
+    """Color identity histogram by total card quantity."""
+    counts: dict[str, int] = {}
+    for r in rows:
+        sd = scryfall_data.get(r["name"])
+        if not sd:
+            continue
+        ci = sd.get("color_identity") or []
+        key = "".join(sorted(ci)) or "C"
+        counts[key] = counts.get(key, 0) + int(r.get("quantity", 1))
+    return counts
+
+
+def _top_sets(rows: list[dict], top_n: int = 10) -> list[dict]:
+    counts: dict[str, int] = {}
+    for r in rows:
+        code = r.get("set_code")
+        if not code:
+            continue
+        counts[code] = counts.get(code, 0) + int(r.get("quantity", 1))
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    return [{"set_code": code, "count": qty} for code, qty in ranked[:top_n]]
+
+
+@mcp.tool()
+async def import_collection(
+    source: str,
+    persist: bool = False,
+) -> dict:
+    """Import a Magic collection from a Delver Lens CSV export
+    (or a compatible Moxfield / TCGPlayer / Deckbox / MTGstand preset).
+
+    `source` accepts:
+      - a local file path (e.g. ``/Users/me/Downloads/delver.csv``)
+      - an http(s):// URL serving CSV
+      - pasted CSV text (must include a header row)
+
+    Column variants are auto-detected: Name/Card Name/Card,
+    Quantity/Count/Qty, Set Code/Edition/Set, Foil/Printing/Finish,
+    Scryfall ID, etc.
+
+    Names are resolved via Scryfall (preferring scryfall_id when
+    present; batch + fuzzy fallback otherwise). Rows Scryfall can't
+    match are returned in `unresolved` and excluded from totals.
+
+    If `persist=True`, writes the parsed collection to
+    ``~/.local/share/mtg-commander-mcp/collection.json`` so the other
+    collection tools can run without re-passing the source.
+
+    Args:
+        source: file path, URL, or pasted CSV text
+        persist: store as the active collection on disk (default False)
+    """
+    try:
+        rows = await delver.parse_source(source)
+    except DelverError as e:
+        return {"error": str(e)}
+
+    resolved, scryfall_data, unresolved = await _resolve_rows(rows)
+
+    total_qty = sum(int(r.get("quantity", 1)) for r in resolved)
+    unique = len({r["name"] for r in resolved})
+    value = _sum_collection_value(resolved, scryfall_data)
+
+    persisted_path: str | None = None
+    if persist:
+        try:
+            payload = {
+                "version": 1,
+                "rows": resolved,
+                "unresolved": [
+                    {"name": r.get("name"), "quantity": r.get("quantity")}
+                    for r in unresolved
+                ],
+            }
+            persisted_path = str(storage.save_collection(payload))
+        except OSError as e:
+            logger.warning("Failed to persist collection: %s", e)
+            return {
+                "error": f"Parsed OK but failed to persist: {e}",
+                "unique_cards": unique,
+                "total_quantity": total_qty,
+            }
+
+    return {
+        "unique_cards": unique,
+        "total_quantity": total_qty,
+        "estimated_value_usd": value,
+        "unresolved": [
+            {"name": r.get("name"), "quantity": r.get("quantity")}
+            for r in unresolved
+        ],
+        "persisted": persisted_path is not None,
+        "persisted_path": persisted_path,
+    }
+
+
+def _load_active() -> tuple[list[dict] | None, str | None]:
+    """Return (rows, error). One will be None."""
+    payload = storage.load_collection()
+    if payload is None:
+        return None, (
+            "No active collection. Call import_collection(source, persist=True) first."
+        )
+    rows = payload.get("rows") or []
+    return rows, None
+
+
+@mcp.tool()
+async def collection_summary(refresh: bool = False) -> dict:
+    """Stats on the persisted active collection.
+
+    Returns unique-card and total-quantity counts, estimated USD value
+    (TCGPlayer via Scryfall), color identity breakdown, and the top
+    sets by card count.
+
+    Args:
+        refresh: if True, re-fetches Scryfall data instead of relying
+                 on the in-process cache (useful if pricing has shifted)
+    """
+    rows, err = _load_active()
+    if err:
+        return {"error": err}
+
+    # Re-resolve to get fresh Scryfall data (cached unless refresh=True
+    # ages out the entries — there's no per-call bypass yet, so
+    # `refresh` is a hint rather than a hard miss). The 5-minute TTL
+    # already keeps prices reasonably fresh.
+    if refresh:
+        scryfall._cache._store.clear()
+
+    _, scryfall_data, _ = await _resolve_rows(rows or [])
+
+    return {
+        "unique_cards": len({r["name"] for r in rows}),
+        "total_quantity": sum(int(r.get("quantity", 1)) for r in rows),
+        "estimated_value_usd": _sum_collection_value(rows, scryfall_data),
+        "color_identity_breakdown": _color_breakdown(rows, scryfall_data),
+        "top_sets": _top_sets(rows),
+    }
+
+
+async def _gather_decks(
+    deck_urls: list[str] | None,
+    archidekt_username: str | None,
+) -> tuple[list[dict], list[dict]]:
+    """Fetch every deck the user pointed at.
+
+    Returns (decks, errors). ``errors`` is a per-URL list so a single
+    bad URL doesn't kill the whole tool call — the user gets a partial
+    result with a clear "this URL failed" entry.
+    """
+    urls: list[str] = list(deck_urls or [])
+
+    if archidekt_username:
+        try:
+            user_decks = await archidekt.list_user_decks(archidekt_username)
+            urls.extend(d["url"] for d in user_decks)
+        except ArchidektError as e:
+            logger.warning(
+                "list_user_decks(%r) failed; continuing with explicit URLs: %s",
+                archidekt_username, e,
+            )
+
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    unique_urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+    decks: list[dict] = []
+    errors: list[dict] = []
+
+    async def _fetch_one(u: str):
+        try:
+            d = await _import_deck(u)
+            if "error" in d:
+                return u, None, d["error"]
+            return u, d, None
+        except (ArchidektError, MoxfieldError) as e:
+            return u, None, str(e)
+
+    results = await asyncio.gather(*(_fetch_one(u) for u in unique_urls))
+    for url, deck, err in results:
+        if err:
+            errors.append({"url": url, "error": err})
+        elif deck:
+            deck["__url"] = url  # for the response payload
+            decks.append(deck)
+    return decks, errors
+
+
+@mcp.tool()
+async def compute_card_allocation(
+    deck_urls: list[str],
+    archidekt_username: str | None = None,
+) -> dict:
+    """Compute, across the active collection and the listed decks, how
+    each card is allocated.
+
+    Pulls every deck URL plus (optionally) every Commander deck owned by
+    `archidekt_username`. Returns:
+
+      - `committed`: {card_name: total_qty_in_decks}
+      - `free`: {card_name: max(0, owned - committed)}
+      - `over_committed`: [{name, owned, committed}] — cards used in
+        more decks than you actually own
+      - `decks_loaded`: [{name, url, card_count}]
+      - `deck_errors`: [{url, error}] — URLs that failed to import
+
+    Args:
+        deck_urls: explicit Archidekt or Moxfield deck URLs
+        archidekt_username: optional, auto-include user's Commander decks
+    """
+    rows, err = _load_active()
+    if err:
+        return {"error": err}
+
+    owned = col_lib.aggregate_owned(rows)
+    decks, errors = await _gather_decks(deck_urls, archidekt_username)
+    committed = col_lib.aggregate_committed(decks)
+    free, over = col_lib.free_pool(owned, committed)
+
+    return {
+        "committed": committed,
+        "free": free,
+        "over_committed": over,
+        "decks_loaded": [
+            {
+                "name": d.get("name"),
+                "url": d.get("__url"),
+                "card_count": d.get("card_count"),
+            }
+            for d in decks
+        ],
+        "deck_errors": errors,
+    }
+
+
+async def _price_buy_list(buy_list: list[dict]) -> dict:
+    """Price a list of {name, quantity} cards via Scryfall (TCGPlayer).
+
+    Mirrors price_deck's resolve-then-fallback pattern at server.py:670
+    but only fetches TCGPlayer USD — no Card Kingdom / EDHRec round-
+    trips. Card Kingdom pricing for the buy list is a future
+    enhancement.
+    """
+    if not buy_list:
+        return {"items": [], "total_usd": 0.0, "missing": []}
+
+    names = list({c["name"] for c in buy_list})
+    try:
+        scryfall_data, not_found = await scryfall.get_collection(names)
+    except ScryfallError as e:
+        return {"items": [], "total_usd": 0.0, "missing": names, "error": str(e)}
+
+    needs_fallback: list[str] = list(not_found)
+    fallback_set = set(needs_fallback)
+    for name in names:
+        sd = scryfall_data.get(name)
+        if sd is None or not (sd.get("prices") or {}).get("usd"):
+            if name not in fallback_set:
+                needs_fallback.append(name)
+                fallback_set.add(name)
+
+    if needs_fallback:
+        sem = asyncio.Semaphore(4)
+
+        async def _one(n: str):
+            async with sem:
+                try:
+                    return n, await scryfall.get_card_price(n)
+                except ScryfallError as e:
+                    return n, e
+
+        for name, fb in await asyncio.gather(*(_one(n) for n in needs_fallback)):
+            if isinstance(fb, ScryfallError):
+                continue
+            scryfall_data[name] = fb
+
+    total = 0.0
+    items: list[dict] = []
+    missing: list[str] = []
+    for entry in buy_list:
+        name = entry["name"]
+        qty = int(entry["quantity"])
+        sd = scryfall_data.get(name) or {}
+        usd = (sd.get("prices") or {}).get("usd")
+        if usd:
+            unit = float(usd)
+            line = round(unit * qty, 2)
+            total += line
+            items.append(
+                {
+                    "name": name,
+                    "quantity": qty,
+                    "unit_price_usd": round(unit, 2),
+                    "line_total_usd": line,
+                }
+            )
+        else:
+            missing.append(name)
+            items.append(
+                {
+                    "name": name,
+                    "quantity": qty,
+                    "unit_price_usd": None,
+                    "line_total_usd": None,
+                }
+            )
+
+    return {
+        "items": items,
+        "total_usd": round(total, 2),
+        "missing": missing,
+    }
+
+
+@mcp.tool()
+async def pull_and_buy_lists(
+    new_deck: str,
+    deck_urls: list[str] | None = None,
+    archidekt_username: str | None = None,
+    include_basics: bool = False,
+) -> dict:
+    """Cross-reference your collection × existing decks × a new deck.
+
+    Given a new deck under construction (Archidekt URL, Moxfield URL,
+    or pasted ``1 Sol Ring``-style decklist text) and the set of decks
+    you've already built (passed as URLs and/or auto-discovered from
+    `archidekt_username`), returns:
+
+      - `pull_list`: cards to physically pull from your collection,
+        constrained by the *free* pool — i.e., copies not already
+        committed to your other decks
+      - `buy_list`: cards the new deck needs that aren't in the free
+        pool, with per-card and total TCGPlayer prices
+      - `over_commit_warnings`: cards the new deck wants that are
+        already over-allocated across existing decks (e.g., new deck
+        wants 1 Sol Ring but you already use it in 3 other decks while
+        owning 2 copies)
+      - `deck_errors`: per-URL errors from the existing-deck imports
+
+    Basic lands are skipped by default — most Delver users don't track
+    them. Set `include_basics=True` if you do.
+
+    Args:
+        new_deck: deck URL or pasted decklist
+        deck_urls: list of existing-deck URLs (Archidekt/Moxfield)
+        archidekt_username: optional, auto-include user's Commander decks
+        include_basics: include basic lands in the buy list (default False)
+    """
+    rows, err = _load_active()
+    if err:
+        return {"error": err}
+
+    # Resolve "new deck" — URL or pasted decklist.
+    new_deck_cards: dict[str, int]
+    new_deck_meta: dict
+    if new_deck.startswith(("http://", "https://")):
+        try:
+            parsed = await _import_deck(new_deck)
+            if "error" in parsed:
+                return {"error": f"new_deck: {parsed['error']}"}
+        except (ArchidektError, MoxfieldError) as e:
+            return {"error": f"new_deck: {e}"}
+        new_deck_cards = col_lib.deck_card_counts(parsed)
+        new_deck_meta = {
+            "source": "url",
+            "url": new_deck,
+            "name": parsed.get("name"),
+        }
+    else:
+        new_deck_cards = col_lib.parse_decklist_text(new_deck)
+        if not new_deck_cards:
+            return {
+                "error": (
+                    "new_deck is neither a URL nor a parseable decklist "
+                    "(expected lines like '1 Sol Ring')"
+                )
+            }
+        new_deck_meta = {"source": "text", "card_count": sum(new_deck_cards.values())}
+
+    owned = col_lib.aggregate_owned(rows)
+    existing_decks, deck_errors = await _gather_decks(deck_urls, archidekt_username)
+    committed = col_lib.aggregate_committed(existing_decks)
+    free, _over = col_lib.free_pool(owned, committed)
+
+    allocation = col_lib.pull_and_buy(
+        new_deck_cards,
+        free=free,
+        owned=owned,
+        committed=committed,
+        include_basics=include_basics,
+    )
+
+    pricing = await _price_buy_list(allocation["buy_list"])
+
+    return {
+        "new_deck": new_deck_meta,
+        "decks_considered": [
+            {"name": d.get("name"), "url": d.get("__url")} for d in existing_decks
+        ],
+        "deck_errors": deck_errors,
+        "pull_list": allocation["pull_list"],
+        "buy_list": pricing["items"],
+        "buy_list_total_usd": pricing["total_usd"],
+        "buy_list_missing_prices": pricing["missing"],
+        "over_commit_warnings": allocation["over_commit_warnings"],
     }
 
 
