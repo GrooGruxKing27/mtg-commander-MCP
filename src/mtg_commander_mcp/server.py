@@ -209,6 +209,32 @@ async def _import_deck(url: str) -> dict:
         return {"error": "Unsupported URL. Provide an Archidekt or Moxfield deck URL."}
 
 
+def _deck_id_from_url(url: str) -> str | None:
+    """Best-effort deck-ID extraction for Archidekt + Moxfield URLs.
+
+    Used by ``pull_and_buy_lists`` to dedupe the new deck out of the
+    existing-deck set when Archidekt auto-discovery surfaces it.
+    Returns a source-prefixed ID (``"archidekt:22444881"`` /
+    ``"moxfield:abc123"``) so an Archidekt deck never falsely matches
+    a Moxfield deck with the same numeric path. Returns None for
+    unrecognized URLs — those bypass the dedupe and fall through to
+    string equality elsewhere.
+    """
+    if not url:
+        return None
+    if "archidekt.com" in url:
+        try:
+            return f"archidekt:{ArchidektClient.extract_deck_id(url)}"
+        except ArchidektError:
+            return None
+    if "moxfield.com" in url:
+        try:
+            return f"moxfield:{MoxfieldClient.extract_deck_id(url)}"
+        except MoxfieldError:
+            return None
+    return None
+
+
 @mcp.tool()
 async def import_deck(url: str) -> dict:
     """Import a deck from an Archidekt or Moxfield URL.
@@ -1103,15 +1129,18 @@ async def compute_card_allocation(
     archidekt_username: str | None = None,
 ) -> dict:
     """Compute, across the active collection and the listed decks, how
-    each card is allocated.
+    each card is allocated — by *printing*, not just by name.
 
     Pulls every deck URL plus (optionally) every Commander deck owned by
     `archidekt_username`. Returns:
 
-      - `committed`: {card_name: total_qty_in_decks}
-      - `free`: {card_name: max(0, owned - committed)}
-      - `over_committed`: [{name, owned, committed}] — cards used in
-        more decks than you actually own
+      - `committed`: [{name, set_code, collector_number, quantity,
+        scryfall_id}] — cards used across the listed decks, one row
+        per distinct printing
+      - `free`: same row shape, owned − committed clamped at 0; zero-
+        quantity rows are filtered out
+      - `over_committed`: [{name, set_code, collector_number, owned,
+        committed}] — printings used in more decks than you own copies
       - `decks_loaded`: [{name, url, card_count}]
       - `deck_errors`: [{url, error}] — URLs that failed to import
 
@@ -1260,26 +1289,42 @@ async def pull_and_buy_lists(
     archidekt_username: str | None = None,
     include_basics: bool = False,
 ) -> dict:
-    """Cross-reference your collection × existing decks × a new deck.
+    """Cross-reference your collection × existing decks × a new deck,
+    printing-aware on both inventory and deck slots.
 
     Given a new deck under construction (Archidekt URL, Moxfield URL,
     or pasted ``1 Sol Ring``-style decklist text) and the set of decks
     you've already built (passed as URLs and/or auto-discovered from
     `archidekt_username`), returns:
 
-      - `pull_list`: cards to physically pull from your collection,
-        constrained by the *free* pool — i.e., copies not already
-        committed to your other decks
-      - `buy_list`: cards the new deck needs that aren't in the free
-        pool, with per-card and total TCGPlayer prices
-      - `over_commit_warnings`: cards the new deck wants that are
-        already over-allocated across existing decks (e.g., new deck
-        wants 1 Sol Ring but you already use it in 3 other decks while
-        owning 2 copies)
-      - `deck_errors`: per-URL errors from the existing-deck imports
+      - `pull_list`: [{name, set_code, collector_number, scryfall_id,
+        quantity, from_free_pool, match_tier}] — cards to physically
+        pull from your collection, with the specific printing chosen
+        and a tier indicating how it matched the deck slot
+        (``exact`` / ``set`` / ``name``). Constrained by the free pool
+        (copies not already committed to other decks).
+      - `buy_list`: [{name, set_code, set_name, collector_number,
+        scryfall_id, finish, quantity, unit_price_usd, line_total_usd}]
+        — cards the new deck needs that aren't in the free pool,
+        priced at the cheapest English paper printing (foil or nonfoil,
+        whichever is cheaper).
+      - `buy_list_total_usd`: sum of `line_total_usd` across the buy
+        list.
+      - `buy_list_missing_prices`: names where no priced English paper
+        printing was found.
+      - `over_commit_warnings`: [{name, requested, owned,
+        committed_other_decks}] — name-level signal that the new deck
+        wants a card you've already over-allocated.
+      - `decks_considered`: [{name, url}] — existing decks that
+        actually contributed (the new deck's own URL is excluded if
+        Archidekt auto-discovery surfaced it).
+      - `deck_errors`: per-URL errors from the existing-deck imports.
 
-    Basic lands are skipped by default — most Delver users don't track
-    them. Set `include_basics=True` if you do.
+    Printing match is a *preference*, not a hard filter: if the deck
+    slot calls for Sol Ring (CMM) and you only own the M21 printing,
+    the allocator still pulls from inventory and reports
+    ``match_tier="name"``. Basic lands are skipped by default — most
+    Delver users don't track them. Set `include_basics=True` if you do.
 
     Args:
         new_deck: deck URL or pasted decklist
@@ -1324,6 +1369,21 @@ async def pull_and_buy_lists(
 
     owned = col_lib.aggregate_owned(rows)
     existing_decks, deck_errors = await _gather_decks(deck_urls, archidekt_username)
+
+    # Drop the new deck from the existing-deck set if Archidekt
+    # auto-discovery (or an explicit deck_urls entry) pulled it in.
+    # Otherwise every card in the new deck shows committed_other_decks=1
+    # against itself, inflating over_commit_warnings and (worse)
+    # consuming inventory that should be free to allocate. Only matters
+    # for URL-source new decks — pasted text doesn't have a URL to dedupe.
+    if new_deck.startswith(("http://", "https://")):
+        new_deck_id = _deck_id_from_url(new_deck)
+        if new_deck_id:
+            existing_decks = [
+                d for d in existing_decks
+                if _deck_id_from_url(d.get("__url") or "") != new_deck_id
+            ]
+
     committed = col_lib.aggregate_committed(existing_decks)
     free, _over = col_lib.free_pool(owned, committed)
 
