@@ -24,6 +24,12 @@ class Cache:
     eviction). Both bounds are needed for a long-running daemon: TTL alone
     lets the cache grow without limit if every entry is accessed within its
     window, and LRU alone lets stale data linger indefinitely.
+
+    TTL is bound to *write* time — reads do not extend an entry's lifetime.
+    Reads do mark the entry as recently used for LRU purposes, but the TTL
+    clock keeps ticking from the original ``set()`` call. This is the right
+    behavior for "data freshness" caches (we want stale Scryfall prices to
+    expire even if they're being read constantly).
     """
 
     def __init__(self, ttl: float = 300, max_size: int = 2048):

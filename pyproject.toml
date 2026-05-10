@@ -1,6 +1,6 @@
 [project]
 name = "mtg-commander-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for Magic: The Gathering Commander/EDH - EDHRec, Scryfall, Archidekt, Moxfield, and MTG Rules"
 requires-python = ">=3.11"
 dependencies = [

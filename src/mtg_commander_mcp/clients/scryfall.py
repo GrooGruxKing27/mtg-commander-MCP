@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import time
 
 import httpx
 
 from mtg_commander_mcp import __version__
 from mtg_commander_mcp.utils import Cache
+
+logger = logging.getLogger(__name__)
 
 
 class ScryfallError(Exception):
@@ -188,16 +191,30 @@ class ScryfallClient:
 
         Up to 75 names per HTTP request, so a 100-card deck costs 2 round-
         trips instead of 100 fuzzy lookups.
+
+        Results are cached for ``Cache.ttl`` (default 5min) keyed on the input
+        name set, so repeating the same `price_deck` call within that window
+        is free.
         """
         if not names:
             return {}, []
 
+        # Cache is keyed on the unordered set of names so re-pricing the
+        # same deck (or two decks with overlapping cards re-issued in the
+        # same window) skips the POSTs.
+        cache_key = f"collection:{frozenset(names)}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         client = self._get_client()
         result: dict[str, dict] = {}
         not_found: list[str] = []
+        not_found_set: set[str] = set()
         # Lowercase->original lookup so we can map Scryfall's canonicalized
         # response name back to whatever case the caller passed in.
         name_lookup = {n.lower(): n for n in names}
+        valid_inputs = set(name_lookup.values())
 
         for batch_start in range(0, len(names), 75):
             batch = names[batch_start : batch_start + 75]
@@ -236,15 +253,18 @@ class ScryfallClient:
             # canonicalization quirks.
             for nf in data.get("not_found", []):
                 nf_name = nf.get("name") if isinstance(nf, dict) else None
-                if nf_name and nf_name in name_lookup.values():
+                if nf_name and nf_name in valid_inputs and nf_name not in not_found_set:
                     not_found.append(nf_name)
+                    not_found_set.add(nf_name)
             # Belt-and-suspenders: any input from this batch that didn't match
             # AND wasn't in `not_found` (e.g. Scryfall returned a different
             # canonical form we couldn't map) goes through fallback too.
             for name in batch:
-                if name not in matched_in_batch and name not in not_found:
+                if name not in matched_in_batch and name not in not_found_set:
                     not_found.append(name)
+                    not_found_set.add(name)
 
+        self._cache.set(cache_key, (result, not_found))
         return result, not_found
 
     async def get_card_price(self, name: str) -> dict:
@@ -264,8 +284,15 @@ class ScryfallClient:
                         if p.get("usd"):
                             prices = p
                             break
-                except ScryfallError:
-                    pass
+                except ScryfallError as e:
+                    # Prints-search fallback failed; the caller will get the
+                    # default printing's (price-less) data and report the card
+                    # as missing. Log so the operator can tell whether it's
+                    # rate-limit pressure vs a genuinely missing oracle.
+                    logger.warning(
+                        "Scryfall prints-search fallback failed for %r: %s",
+                        name, e,
+                    )
 
         return {
             "name": data.get("name"),

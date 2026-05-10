@@ -1,9 +1,12 @@
 import asyncio
+import logging
 
 import httpx
 
 from mtg_commander_mcp import __version__
 from mtg_commander_mcp.utils import Cache, to_slug
+
+logger = logging.getLogger(__name__)
 
 
 class EDHRecError(Exception):
@@ -61,7 +64,7 @@ class EDHRecClient:
         self._cache.set(path, data)
         return data
 
-    def _extract_cardlists(self, data: dict, limit: int | None = None) -> list[dict]:
+    def _extract_cardlists(self, data: dict) -> list[dict]:
         """Extract card lists from EDHRec container response."""
         categories = []
         container = data.get("container", data)
@@ -85,8 +88,6 @@ class EDHRecClient:
                 if prices:
                     card["prices"] = prices
                 cards.append(card)
-            if limit:
-                cards = cards[:limit]
             if cards:
                 categories.append({"category": header, "cards": cards})
         return categories
@@ -291,7 +292,8 @@ class EDHRecClient:
             async with sem:
                 try:
                     return name, await self.get_card(name)
-                except (EDHRecError, httpx.HTTPError):
+                except (EDHRecError, httpx.HTTPError) as e:
+                    logger.warning("EDHRec lookup failed for %r: %s", name, e)
                     return name, None
 
         results = await asyncio.gather(*(fetch_one(n) for n in names))

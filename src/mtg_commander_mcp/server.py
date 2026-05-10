@@ -1,7 +1,10 @@
 import asyncio
+import logging
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger(__name__)
 
 from mtg_commander_mcp.clients.edhrec import EDHRecClient, EDHRecError, VALID_COLOR_FILTERS
 from mtg_commander_mcp.clients.scryfall import ScryfallClient, ScryfallError
@@ -144,7 +147,7 @@ async def edhrec_search_commanders(
 @mcp.tool()
 async def scryfall_card(card_name: str) -> dict:
     """Look up a card on Scryfall. Returns full card data including oracle text,
-    mana cost, type line, legality, pricing (TCGPlayer + Cardmarket), and image.
+    mana cost, type line, legality, Scryfall pricing (usd / eur / tix), and image.
 
     Args:
         card_name: The card's name (fuzzy matching supported)
@@ -244,7 +247,6 @@ async def analyze_deck(url: str) -> dict:
 
         # Mana curve
         mana_curve: dict[int, int] = {}
-        color_pips: dict[str, int] = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0}
         type_counts: dict[str, int] = {}
         land_count = 0
         nonland_count = 0
@@ -289,8 +291,11 @@ async def analyze_deck(url: str) -> dict:
                                     break
                     if len(edhrec_suggestions) >= 10:
                         break
-            except EDHRecError:
-                pass
+            except EDHRecError as e:
+                logger.warning(
+                    "EDHRec recommendations unavailable for %r in analyze_deck: %s",
+                    commander_name, e,
+                )
 
         # Mana base analysis
         total_cards = sum(c.get("quantity", 1) for c in all_cards)
@@ -370,7 +375,11 @@ async def build_deck(
                 "suggested_commanders": top_cmds,
                 "hint": "Call build_deck again with one of these commander names.",
             }
-        except EDHRecError:
+        except EDHRecError as e:
+            logger.warning(
+                "EDHRec lookup failed for non-commander suggestion of %r: %s",
+                card_name, e,
+            )
             return {
                 "message": f"'{card_data['name']}' is not a valid commander and no EDHRec data found for it.",
                 "hint": "Try a legendary creature instead.",
@@ -381,7 +390,12 @@ async def build_deck(
     # Fetch average deck as baseline
     try:
         avg_deck = await edhrec.get_average_deck(commander_name)
-    except EDHRecError:
+    except EDHRecError as e:
+        logger.warning(
+            "EDHRec average-deck unavailable for %r in build_deck (continuing "
+            "with recommendations only): %s",
+            commander_name, e,
+        )
         avg_deck = None
 
     # Fetch recommendations for enrichment
@@ -522,24 +536,32 @@ async def build_deck(
 
     land_slot_count = sum(c.get("quantity", 1) for c in land_cards)
     if land_slot_count > target_lands:
-        # Truncate by keeping the cheapest lands first (cards without price
-        # data sort last). On a budget build this avoids dropping a $0.30
-        # check-land in favor of keeping a $40 fetchland just because EDHRec
-        # listed the fetchland earlier in its recommendation order.
-        def _land_price(c: dict) -> float:
-            prices = c.get("prices") or {}
-            for key in ("cardkingdom", "tcgplayer"):
-                val = prices.get(key)
-                if isinstance(val, dict):
-                    val = val.get("price")
-                if val is not None:
-                    try:
-                        return float(str(val).replace("$", "").replace(",", ""))
-                    except (ValueError, TypeError):
-                        continue
-            return float("inf")
+        # Two truncation strategies depending on whether the user opted into
+        # a budget filter:
+        #   - budget / modest: keep the cheapest lands first (cards without
+        #     price data sort last). This stops us dropping a $0.30 check-
+        #     land in favor of keeping a $40 fetchland just because EDHRec
+        #     happened to list the fetchland earlier.
+        #   - no_limit: the user explicitly opted out of price filtering, so
+        #     respect EDHRec's synergy/inclusion order and don't bury
+        #     expensive-but-correct lands (fetches, original duals).
+        if budget == "no_limit":
+            land_cards = land_cards[:target_lands]
+        else:
+            def _land_price(c: dict) -> float:
+                prices = c.get("prices") or {}
+                for key in ("cardkingdom", "tcgplayer"):
+                    val = prices.get(key)
+                    if isinstance(val, dict):
+                        val = val.get("price")
+                    if val is not None:
+                        try:
+                            return float(str(val).replace("$", "").replace(",", ""))
+                        except (ValueError, TypeError):
+                            continue
+                return float("inf")
 
-        land_cards = sorted(land_cards, key=_land_price)[:target_lands]
+            land_cards = sorted(land_cards, key=_land_price)[:target_lands]
         grouped["Lands"] = land_cards
 
     land_slot_total = sum(c.get("quantity", 1) for c in grouped["Lands"])
@@ -740,6 +762,13 @@ async def price_deck(url: str) -> dict:
         qty_by_name = {c["name"]: c.get("quantity", 1) for c in all_cards}
         for name, fb in zip(needs_tcg_fallback, fallback_results):
             if isinstance(fb, Exception):
+                # Log the lost exception detail so the operator can tell
+                # rate-limit pressure from genuinely-missing cards when
+                # `cards_missing` jumps unexpectedly on a particular run.
+                logger.warning(
+                    "Scryfall fuzzy fallback failed for %r in price_deck: %s",
+                    name, fb,
+                )
                 tcg_missing.append(name)
                 continue
             usd = (fb.get("prices") or {}).get("usd")

@@ -5,6 +5,63 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-10 — second-pass cleanup
+
+Addresses the seven-item punch list from the v0.2.0 re-review.
+
+### Fixed
+- **README rate-limit caveat was actively misleading** — said "wait a
+  minute" as though the issue were intrinsic, even though the in-process
+  throttle race that amplified it was fixed in 0.2.0. Rewrote to
+  distinguish the (fixed) race from the (still-real but rarer) per-IP
+  burst limit, so users know the difference.
+- **`build_deck` land truncation under `no_limit`** was sorting by price
+  ascending — wrong, since the user explicitly opted out of price
+  filtering. Now uses EDHRec's order on `no_limit`, price-ascending only
+  on budget/modest tiers.
+- **`scryfall_card` docstring** said "TCGPlayer + Cardmarket" but the
+  data dict surfaces Scryfall's `prices` object (usd / eur / tix). Doc
+  now matches.
+
+### Added
+- **Stderr logging** at every previously-silent failure site:
+  `EDHRecClient.get_cards_concurrent`, `ScryfallClient.get_card_price`'s
+  prints-search fallback, `analyze_deck`'s EDHRec recommendations,
+  `build_deck`'s `avg_deck` and not-a-commander suggestion paths, and
+  `price_deck`'s `return_exceptions=True` fallback gather. A small
+  package-level config in `__init__.py` sets up a stderr WARNING
+  handler unless the embedding application has already configured
+  logging — keeps Claude Desktop's MCP log useful without polluting
+  callers that have their own setup.
+- **`get_collection` cache.** Repeat `price_deck` on the same deck
+  within ~5 minutes is now ~half the cold runtime (verified: 14.1s cold
+  → 6.58s warm). Keyed on `frozenset(names)` so two decks that share
+  cards still benefit.
+- **Glossary parser max-size sanity check.** Already warned on too-few
+  entries; now also warns on >5000 (parser over-matching after a WotC
+  format change is just as bad as parser falling off).
+
+### Changed
+- **`Cache` docstring** now documents that TTL is bound to write time
+  and reads do not extend lifetime — a deliberate "data freshness"
+  policy that wasn't called out before.
+- **`get_collection` not-found tracking** uses a set for membership
+  (was O(n²) over 75-item batches; trivial scale, but matches the
+  call-site's `fallback_set` pattern).
+- **`__version__` bumped to 0.2.1** in both `__init__.py` and
+  `pyproject.toml` (they had drifted out of sync in the v0.2.0 ship).
+
+### Removed
+- **Dead `color_pips` dict** in `analyze_deck` — was initialized
+  `{"W": 0, …}` and never written or returned. Faithful pip counting
+  needs `mana_cost` symbols which Archidekt's parser doesn't expose;
+  going with the panel's "or delete" option.
+- **Unused `limit` parameter** on `EDHRecClient._extract_cardlists` —
+  no caller passed it.
+- **`__import__("sys").stderr`** hack in `rules.py` — replaced with a
+  proper `import sys` at the top.
+- **Unused `import os`** in `rules.py`.
+
 ## [0.2.0] — 2026-05-10 — panel-review pass
 
 Addresses the must-fix and should-fix items from a panel code review.

@@ -1,7 +1,7 @@
 import asyncio
 import json
-import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -84,18 +84,27 @@ class RulesClient:
         self._parse_rules(text)
         self._source_url = current_url
 
-        # Sanity check: parsing should yield hundreds of glossary entries; an
-        # empty or near-empty parse means the WotC text format changed and the
-        # heuristic parser silently fell off. Surface it on stderr so the
-        # operator notices before users start filing "rules tool returns
-        # nothing" reports.
-        if self._glossary is not None and len(self._glossary) < 100:
-            print(
-                f"[mtg-commander-mcp] WARNING: parsed only {len(self._glossary)} "
-                "glossary entries from comprehensive rules — parser may need "
-                "updating for a new WotC text format.",
-                file=__import__("sys").stderr,
-            )
+        # Sanity check: a healthy parse yields ~700 glossary entries. Both
+        # too few (parser fell off; format drift) and too many (parser is
+        # over-matching; e.g. now grabbing rule lines) indicate the heuristic
+        # is broken. Surface either on stderr so the operator notices before
+        # users start filing "rules tool returns nothing / garbage" reports.
+        if self._glossary is not None:
+            n = len(self._glossary)
+            if n < 100:
+                print(
+                    f"[mtg-commander-mcp] WARNING: parsed only {n} glossary "
+                    "entries from comprehensive rules — parser may need "
+                    "updating for a new WotC text format.",
+                    file=sys.stderr,
+                )
+            elif n > 5000:
+                print(
+                    f"[mtg-commander-mcp] WARNING: parsed {n} glossary entries "
+                    "(expected ~700) — parser may be over-matching after a "
+                    "WotC text format change.",
+                    file=sys.stderr,
+                )
 
     def _find_rules_url(self) -> str:
         """Scrape the Wizards rules page to find the latest TXT download link."""
