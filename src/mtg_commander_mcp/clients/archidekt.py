@@ -2,6 +2,7 @@ import re
 
 import httpx
 
+from mtg_commander_mcp import __version__
 from mtg_commander_mcp.utils import Cache
 
 
@@ -21,7 +22,7 @@ class ArchidektClient:
             self._client = httpx.AsyncClient(
                 timeout=15.0,
                 headers={
-                    "User-Agent": "MTGCommanderMCP/0.1.0",
+                    "User-Agent": f"MTGCommanderMCP/{__version__}",
                     "Accept": "application/json",
                 },
             )

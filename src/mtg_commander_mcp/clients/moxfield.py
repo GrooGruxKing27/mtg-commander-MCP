@@ -1,3 +1,4 @@
+import asyncio
 import re
 from functools import partial
 
@@ -15,12 +16,12 @@ class MoxfieldClient:
 
     def __init__(self):
         self._cache = Cache(ttl=300)
-        self._scraper = None
-
-    def _get_scraper(self) -> cloudscraper.CloudScraper:
-        if self._scraper is None:
-            self._scraper = cloudscraper.create_scraper()
-        return self._scraper
+        # cloudscraper wraps requests.Session, which is not thread-safe — and
+        # we drive it from `run_in_executor`, which uses a thread pool. Either
+        # we'd need a lock around every call (serializing all Moxfield work)
+        # or we create a fresh scraper per call. Construction is cheap enough
+        # (~ms) and Moxfield requests are infrequent and high-latency anyway,
+        # so we go per-call to keep concurrency open.
 
     @staticmethod
     def extract_deck_id(url: str) -> str:
@@ -39,15 +40,13 @@ class MoxfieldClient:
         Uses cloudscraper to bypass Cloudflare protection.
         Runs synchronous requests in a thread executor.
         """
-        import asyncio
-
         deck_id = self.extract_deck_id(url)
         cache_key = f"deck:{deck_id}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             resp = await loop.run_in_executor(
                 None, partial(self._fetch_sync, deck_id)
@@ -60,7 +59,8 @@ class MoxfieldClient:
         return result
 
     def _fetch_sync(self, deck_id: str) -> dict:
-        scraper = self._get_scraper()
+        # Per-call scraper — see __init__ comment.
+        scraper = cloudscraper.create_scraper()
         resp = scraper.get(f"{self.API_URL}/{deck_id}")
         if resp.status_code == 404:
             raise MoxfieldError(f"Deck not found: {deck_id}")

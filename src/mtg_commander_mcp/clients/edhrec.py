@@ -2,6 +2,7 @@ import asyncio
 
 import httpx
 
+from mtg_commander_mcp import __version__
 from mtg_commander_mcp.utils import Cache, to_slug
 
 
@@ -30,7 +31,7 @@ class EDHRecClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=15.0,
-                headers={"User-Agent": "MTGCommanderMCP/0.1.0"},
+                headers={"User-Agent": f"MTGCommanderMCP/{__version__}"},
             )
         return self._client
 

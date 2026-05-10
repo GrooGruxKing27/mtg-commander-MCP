@@ -1,8 +1,9 @@
+import asyncio
+import json
 import os
 import re
-import json
+import time
 from pathlib import Path
-from functools import partial
 
 import httpx
 
@@ -15,6 +16,11 @@ class RulesError(Exception):
 
 CACHE_DIR = Path.home() / ".cache" / "mtg-commander-mcp" / "rules"
 RULES_PAGE_URL = "https://magic.wizards.com/en/rules"
+# How long to trust the cached rules.txt before re-checking the WotC page for
+# a new comprehensive-rules URL. Wizards publishes new rules every ~3 months
+# and the page itself has been down for hours at a time historically; trusting
+# the cache for a day means startup doesn't wedge on wizards.com.
+URL_RECHECK_TTL = 86400  # 24h
 
 
 class RulesClient:
@@ -30,8 +36,7 @@ class RulesClient:
         if self._rules is not None:
             return
 
-        import asyncio
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._load_sync)
 
     def _load_sync(self):
@@ -40,22 +45,34 @@ class RulesClient:
         meta_path = CACHE_DIR / "meta.json"
         rules_path = CACHE_DIR / "rules.txt"
 
-        # Check if we need to download
         need_download = True
         current_url = None
 
         if meta_path.exists() and rules_path.exists():
             meta = json.loads(meta_path.read_text())
             current_url = meta.get("source_url")
-            # Try to find the latest URL
-            try:
-                latest_url = self._find_rules_url()
-                need_download = latest_url != current_url
-                if need_download:
-                    current_url = latest_url
-            except Exception:
-                # Can't check for updates, use cached version
+            checked_at = meta.get("checked_at", 0)
+            age = time.time() - checked_at
+
+            if age < URL_RECHECK_TTL:
+                # Trust the cache — don't even hit wizards.com. This keeps
+                # startup fast and resilient when WotC's site is flaky.
                 need_download = False
+            else:
+                # TTL expired: re-check for a newer URL, but if the WotC page
+                # is down or its layout changed, fall back to the cached file.
+                try:
+                    latest_url = self._find_rules_url()
+                    need_download = latest_url != current_url
+                    if need_download:
+                        current_url = latest_url
+                    else:
+                        # Same URL, just refresh the timestamp so we don't
+                        # re-check on every startup for the next 24h.
+                        meta["checked_at"] = time.time()
+                        meta_path.write_text(json.dumps(meta))
+                except Exception:
+                    need_download = False
 
         if need_download:
             if current_url is None:
@@ -66,6 +83,19 @@ class RulesClient:
         text = rules_path.read_text(encoding="utf-8", errors="replace")
         self._parse_rules(text)
         self._source_url = current_url
+
+        # Sanity check: parsing should yield hundreds of glossary entries; an
+        # empty or near-empty parse means the WotC text format changed and the
+        # heuristic parser silently fell off. Surface it on stderr so the
+        # operator notices before users start filing "rules tool returns
+        # nothing" reports.
+        if self._glossary is not None and len(self._glossary) < 100:
+            print(
+                f"[mtg-commander-mcp] WARNING: parsed only {len(self._glossary)} "
+                "glossary entries from comprehensive rules — parser may need "
+                "updating for a new WotC text format.",
+                file=__import__("sys").stderr,
+            )
 
     def _find_rules_url(self) -> str:
         """Scrape the Wizards rules page to find the latest TXT download link."""
@@ -99,7 +129,9 @@ class RulesClient:
         resp = httpx.get(url, follow_redirects=True, timeout=30.0)
         resp.raise_for_status()
         rules_path.write_bytes(resp.content)
-        meta_path.write_text(json.dumps({"source_url": url}))
+        meta_path.write_text(
+            json.dumps({"source_url": url, "checked_at": time.time()})
+        )
 
     def _parse_rules(self, text: str):
         """Parse the comprehensive rules into searchable structures."""

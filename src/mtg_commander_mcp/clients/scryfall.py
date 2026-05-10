@@ -1,7 +1,9 @@
 import asyncio
+import time
 
 import httpx
 
+from mtg_commander_mcp import __version__
 from mtg_commander_mcp.utils import Cache
 
 
@@ -12,7 +14,7 @@ class ScryfallError(Exception):
 class ScryfallClient:
     BASE_URL = "https://api.scryfall.com"
     HEADERS = {
-        "User-Agent": "MTGCommanderMCP/0.1.0",
+        "User-Agent": f"MTGCommanderMCP/{__version__}",
         "Accept": "application/json",
     }
     # Scryfall asks for 50-100ms between requests
@@ -22,6 +24,11 @@ class ScryfallClient:
         self._client: httpx.AsyncClient | None = None
         self._cache = Cache(ttl=300)
         self._last_request = 0.0
+        # Serializes the "check elapsed → sleep → mark sent" critical section
+        # so concurrent coroutines can't all observe stale `_last_request` and
+        # fire in lockstep. Without this, fan-out tools (price_deck) burst N
+        # requests simultaneously and trip Scryfall's per-IP 429.
+        self._throttle_lock = asyncio.Lock()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -32,6 +39,14 @@ class ScryfallClient:
             )
         return self._client
 
+    async def _throttle(self) -> None:
+        """Enforce REQUEST_DELAY between Scryfall hits across all coroutines."""
+        async with self._throttle_lock:
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self.REQUEST_DELAY:
+                await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+            self._last_request = time.monotonic()
+
     async def _fetch(self, path: str, params: dict | None = None) -> dict:
         cache_key = f"{path}:{params}"
         cached = self._cache.get(cache_key)
@@ -41,15 +56,10 @@ class ScryfallClient:
         client = self._get_client()
 
         for attempt in range(3):
-            # Rate limiting
-            now = asyncio.get_event_loop().time()
-            elapsed = now - self._last_request
-            if elapsed < self.REQUEST_DELAY:
-                await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+            await self._throttle()
 
             try:
                 resp = await client.get(path, params=params)
-                self._last_request = asyncio.get_event_loop().time()
 
                 # Retry on rate limit
                 if resp.status_code == 429:
@@ -163,19 +173,28 @@ class ScryfallClient:
             for r in data.get("data", [])
         ]
 
-    async def get_collection(self, names: list[str]) -> dict[str, dict]:
+    async def get_collection(
+        self, names: list[str]
+    ) -> tuple[dict[str, dict], list[str]]:
         """Batch-look up cards by name via /cards/collection.
 
-        Returns a dict mapping the input name to the card's full Scryfall data
-        (including a "prices" subdict). Names that Scryfall couldn't resolve
-        are absent from the result. Up to 75 names per HTTP request, so a
-        100-card deck costs 2 round-trips instead of 100 fuzzy lookups.
+        Returns ``(found, not_found)`` where ``found`` maps the input name to
+        the card's full Scryfall data (including a ``prices`` subdict) and
+        ``not_found`` is the list of input names Scryfall couldn't resolve via
+        exact match. The caller can route ``not_found`` through the per-card
+        fuzzy fallback (``get_card_price``) which handles apostrophe / accent
+        / casing edge cases that exact-match would miss
+        (e.g. "Jotun Grunt" vs "Jötun Grunt").
+
+        Up to 75 names per HTTP request, so a 100-card deck costs 2 round-
+        trips instead of 100 fuzzy lookups.
         """
         if not names:
-            return {}
+            return {}, []
 
         client = self._get_client()
         result: dict[str, dict] = {}
+        not_found: list[str] = []
         # Lowercase->original lookup so we can map Scryfall's canonicalized
         # response name back to whatever case the caller passed in.
         name_lookup = {n.lower(): n for n in names}
@@ -184,17 +203,12 @@ class ScryfallClient:
             batch = names[batch_start : batch_start + 75]
             identifiers = [{"name": n} for n in batch]
 
-            # Same per-request throttle as the GET path
-            now = asyncio.get_event_loop().time()
-            elapsed = now - self._last_request
-            if elapsed < self.REQUEST_DELAY:
-                await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+            await self._throttle()
 
             try:
                 resp = await client.post(
                     "/cards/collection", json={"identifiers": identifiers}
                 )
-                self._last_request = asyncio.get_event_loop().time()
                 resp.raise_for_status()
                 data = resp.json()
             except httpx.HTTPStatusError as e:
@@ -204,6 +218,7 @@ class ScryfallClient:
             except httpx.TimeoutException as e:
                 raise ScryfallError("Scryfall collection request timed out") from e
 
+            matched_in_batch: set[str] = set()
             for card in data.get("data", []):
                 # Match by lowercase name OR front-face name for DFCs
                 returned = card.get("name", "")
@@ -213,8 +228,24 @@ class ScryfallClient:
                     key = name_lookup.get(front.lower())
                 if key is not None:
                     result[key] = card
+                    matched_in_batch.add(key)
 
-        return result
+            # Trust Scryfall's own `not_found` list rather than re-deriving it
+            # from the response — it carries the exact identifiers that didn't
+            # resolve, so there's no risk of false-positives from name
+            # canonicalization quirks.
+            for nf in data.get("not_found", []):
+                nf_name = nf.get("name") if isinstance(nf, dict) else None
+                if nf_name and nf_name in name_lookup.values():
+                    not_found.append(nf_name)
+            # Belt-and-suspenders: any input from this batch that didn't match
+            # AND wasn't in `not_found` (e.g. Scryfall returned a different
+            # canonical form we couldn't map) goes through fallback too.
+            for name in batch:
+                if name not in matched_in_batch and name not in not_found:
+                    not_found.append(name)
+
+        return result, not_found
 
     async def get_card_price(self, name: str) -> dict:
         """Get pricing info for a card, finding a printing with prices if the default lacks them."""

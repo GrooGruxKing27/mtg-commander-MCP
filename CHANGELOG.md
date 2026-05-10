@@ -5,7 +5,62 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-10 — panel-review pass
+
+Addresses the must-fix and should-fix items from a panel code review.
+
+### Fixed
+- **Scryfall throttle race.** `_last_request` was being read/sleeped/written
+  without serialization, so concurrent coroutines (the EDHRec fan-out, the
+  TCG fallback `gather`) all observed stale timestamps and burst N requests
+  simultaneously, tripping Scryfall's per-IP 429. The check-sleep-mark
+  critical section now lives inside an `asyncio.Lock`, and the README's
+  "wait a minute" caveat goes away.
+- **Unbounded TCG fallback fan-out.** `price_deck`'s fallback `asyncio.gather`
+  fired `len(needs_tcg_fallback)` Scryfall lookups in parallel — could be
+  30+ simultaneous on a deck full of edge-case prints. Now bounded by a
+  `Semaphore(4)`.
+- **Moxfield scraper thread-unsafety.** `cloudscraper` wraps
+  `requests.Session` (not thread-safe) but was driven from a thread-pool
+  executor as a shared instance — concurrent Moxfield imports could corrupt
+  cookie state. Now constructs a fresh scraper per call.
+- **Scryfall `not_found` ignored.** `get_collection` now returns
+  `(found, not_found)` and `price_deck` routes the not-found list through
+  the per-card fuzzy fallback. Picks up cards exact-match misses on
+  apostrophes, accents, and casing (e.g. "Jotun Grunt" vs "Jötun Grunt").
+- **`build_deck` silent under-fill.** A tight budget tier could silently
+  return an 80-card deck. Now adds a `warning` field listing the shortfall
+  and suggesting a wider budget tier.
+- **`build_deck` budget docstring lied** — said "average per-deck" while the
+  implementation is per-card. Docstring now matches the code.
+- **`build_deck` land truncation was order-of-EDHRec-rec.** When the
+  recommended-land pool exceeds the target count, lands are now sorted by
+  price ascending before truncating, so a budget build keeps the cheap
+  check-lands rather than dropping them in favor of fetchlands.
+- **Rules loader blocked startup on `magic.wizards.com`.** Every load did a
+  synchronous HTTP scrape against WotC's rules page to check for a new
+  comprehensive-rules URL, even when the cached `rules.txt` was already
+  fresh. Now writes a `checked_at` timestamp in the cache metadata and only
+  re-checks the WotC page after 24h have elapsed.
+- **`Cache` had no size bound.** TTL alone can't cap memory in a long-
+  running daemon. Added a configurable `max_size` (default 2048) with LRU
+  eviction layered on top of TTL.
+- **Deprecated `asyncio.get_event_loop()` calls** in `scryfall.py`,
+  `moxfield.py`, and `rules.py`. Replaced with `time.monotonic()` for the
+  Scryfall throttle clock, `asyncio.get_running_loop()` for the executor
+  hand-offs.
+
 ### Added
+- `__version__` constant in the package, used to drive User-Agent strings
+  in every HTTP client (was previously hardcoded `MTGCommanderMCP/0.1.0`
+  in two places).
+- `Literal` types on `edhrec_top_cards.period`,
+  `edhrec_search_commanders.color_identity`, and `build_deck.budget` so
+  the MCP schema enumerates the valid options instead of failing at the
+  service layer.
+- Glossary parser sanity check: warns on stderr if it parses fewer than
+  100 entries from the comprehensive rules (early-warning that WotC's text
+  format has drifted).
 - `LICENSE` (MIT).
 - This `CHANGELOG.md`.
 

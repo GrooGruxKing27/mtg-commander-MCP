@@ -1,4 +1,5 @@
 import asyncio
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -88,7 +89,7 @@ async def edhrec_commander_themes(commander_name: str) -> dict:
 
 @mcp.tool()
 async def edhrec_top_cards(
-    period: str = "year",
+    period: Literal["year", "month", "week"] = "year",
     limit: int = 20,
 ) -> dict:
     """Get the top EDH cards by time period from EDHRec.
@@ -104,9 +105,19 @@ async def edhrec_top_cards(
         return {"error": str(e)}
 
 
+ColorFilter = Literal[
+    "white", "blue", "black", "red", "green", "colorless",
+    "azorius", "dimir", "rakdos", "gruul", "selesnya",
+    "orzhov", "izzet", "golgari", "boros", "simic",
+    "esper", "grixis", "jund", "naya", "bant",
+    "abzan", "jeskai", "sultai", "mardu", "temur",
+    "five-color",
+]
+
+
 @mcp.tool()
 async def edhrec_search_commanders(
-    color_identity: str,
+    color_identity: ColorFilter,
     limit: int = 25,
 ) -> dict:
     """Browse commanders by color identity from EDHRec.
@@ -315,7 +326,7 @@ async def analyze_deck(url: str) -> dict:
 @mcp.tool()
 async def build_deck(
     card_name: str,
-    budget: str = "modest",
+    budget: Literal["budget", "modest", "no_limit"] = "modest",
     theme: str | None = None,
 ) -> dict:
     """Build a full 100-card Commander deck.
@@ -323,11 +334,18 @@ async def build_deck(
     If the card is a legendary creature, it's used as the commander.
     If not, suggests 3-5 commanders that commonly use the card.
 
-    Budget tiers: "budget" (<$2/card avg), "modest" (<$10/card avg), "no_limit"
+    Budget tiers (per-card price cap, NOT deck average):
+      - "budget":   each non-basic card must be < $2
+      - "modest":   each non-basic card must be < $10
+      - "no_limit": no per-card price filter
+
+    The result may contain fewer than 100 cards when a tight budget excludes
+    too many recommended cards; in that case the response includes a
+    `warning` field listing the shortfall.
 
     Args:
         card_name: A card name to build around
-        budget: Budget tier - "budget", "modest", or "no_limit"
+        budget: Per-card budget tier — "budget", "modest", or "no_limit"
         theme: Optional theme slug from edhrec_commander_themes
     """
     budget_limits = {"budget": 2.0, "modest": 10.0, "no_limit": float("inf")}
@@ -504,7 +522,24 @@ async def build_deck(
 
     land_slot_count = sum(c.get("quantity", 1) for c in land_cards)
     if land_slot_count > target_lands:
-        land_cards = land_cards[:target_lands]
+        # Truncate by keeping the cheapest lands first (cards without price
+        # data sort last). On a budget build this avoids dropping a $0.30
+        # check-land in favor of keeping a $40 fetchland just because EDHRec
+        # listed the fetchland earlier in its recommendation order.
+        def _land_price(c: dict) -> float:
+            prices = c.get("prices") or {}
+            for key in ("cardkingdom", "tcgplayer"):
+                val = prices.get(key)
+                if isinstance(val, dict):
+                    val = val.get("price")
+                if val is not None:
+                    try:
+                        return float(str(val).replace("$", "").replace(",", ""))
+                    except (ValueError, TypeError):
+                        continue
+            return float("inf")
+
+        land_cards = sorted(land_cards, key=_land_price)[:target_lands]
         grouped["Lands"] = land_cards
 
     land_slot_total = sum(c.get("quantity", 1) for c in grouped["Lands"])
@@ -547,13 +582,32 @@ async def build_deck(
         for cards in final_deck.values()
     )
 
-    return {
+    result = {
         "commander": commander_name,
         "budget": budget,
         "theme": theme,
         "total_cards": total_cards,
         "deck": final_deck,
     }
+
+    # Honesty: a Commander deck is 99 + commander = 100. If we couldn't fill
+    # that — typically because a tight budget filtered out too many of the
+    # recommended pool — say so explicitly rather than silently returning an
+    # under-filled deck. Common with `budget` on combo/expensive commanders.
+    if total_cards < 100:
+        shortfall = 100 - total_cards
+        hint = (
+            f"Try `budget=\"modest\"` or `budget=\"no_limit\"`."
+            if budget != "no_limit"
+            else "Try a different theme or commander."
+        )
+        result["warning"] = (
+            f"Deck is {shortfall} card(s) short of 100. The "
+            f"`budget=\"{budget}\"` per-card price cap excluded too many "
+            f"recommended cards to fill out the list. {hint}"
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +651,7 @@ async def price_deck(url: str) -> dict:
     # requests (capped at 8 concurrent) instead of 100 sequential round-trips
     # to each — drops total runtime from ~3 minutes to ~10 seconds.
     try:
-        scryfall_data, edhrec_data = await asyncio.gather(
+        (scryfall_data, scryfall_not_found), edhrec_data = await asyncio.gather(
             scryfall.get_collection(names),
             edhrec.get_cards_concurrent(names),
         )
@@ -612,10 +666,14 @@ async def price_deck(url: str) -> dict:
     ck_missing = []
     card_prices = []
 
-    # Scryfall sometimes returns a default printing without USD pricing
-    # (e.g. promo-only). Track those so we can do a per-card fallback to the
-    # prints-search path that the original implementation used.
-    needs_tcg_fallback: list[str] = []
+    # Scryfall sometimes returns a default printing without USD pricing (e.g.
+    # promo-only) AND its exact-match collection endpoint misses cards that
+    # fuzzy lookup would catch (apostrophe / accent / casing edge cases —
+    # "Jotun Grunt" vs "Jötun Grunt"). Track both here, then run them through
+    # get_card_price's prints-search path. Seed with the exact names Scryfall
+    # told us it couldn't resolve.
+    needs_tcg_fallback: list[str] = list(scryfall_not_found)
+    fallback_set = set(needs_tcg_fallback)
 
     for card in all_cards:
         name = card["name"]
@@ -630,10 +688,12 @@ async def price_deck(url: str) -> dict:
                 tcg_price = float(usd) * qty
                 tcg_total += tcg_price
                 tcg_available += qty
-            else:
+            elif name not in fallback_set:
                 needs_tcg_fallback.append(name)
-        else:
+                fallback_set.add(name)
+        elif name not in fallback_set:
             needs_tcg_fallback.append(name)
+            fallback_set.add(name)
 
         # --- Card Kingdom price via EDHRec ---
         ck_price = None
@@ -663,11 +723,18 @@ async def price_deck(url: str) -> dict:
 
     # Fallback: for cards Scryfall didn't resolve in the batch (or returned
     # without USD pricing), retry per-card via get_card_price which searches
-    # alternate printings. This is the same logic the old serial path used,
-    # just narrowed to the cards that need it.
+    # alternate printings. Bounded with a semaphore so a deck with many
+    # fallback cards doesn't fire 30+ Scryfall requests in lockstep — that
+    # bursts past the per-IP rate limiter even with the global throttle lock.
     if needs_tcg_fallback:
+        fallback_sem = asyncio.Semaphore(4)
+
+        async def _fallback_one(n: str):
+            async with fallback_sem:
+                return await scryfall.get_card_price(n)
+
         fallback_results = await asyncio.gather(
-            *(scryfall.get_card_price(n) for n in needs_tcg_fallback),
+            *(_fallback_one(n) for n in needs_tcg_fallback),
             return_exceptions=True,
         )
         qty_by_name = {c["name"]: c.get("quantity", 1) for c in all_cards}

@@ -18,10 +18,20 @@ def to_slug(name: str) -> str:
 
 
 class Cache:
-    """Simple in-memory TTL cache."""
+    """In-memory TTL + LRU cache.
 
-    def __init__(self, ttl: float = 300):
+    TTL evicts entries by age, ``max_size`` caps total entries (oldest-first
+    eviction). Both bounds are needed for a long-running daemon: TTL alone
+    lets the cache grow without limit if every entry is accessed within its
+    window, and LRU alone lets stale data linger indefinitely.
+    """
+
+    def __init__(self, ttl: float = 300, max_size: int = 2048):
         self._ttl = ttl
+        self._max_size = max_size
+        # OrderedDict-like behaviour using a plain dict (Python 3.7+ preserves
+        # insertion order). On access we move the key to the end to track
+        # recency.
         self._store: dict[str, tuple[float, Any]] = {}
 
     def get(self, key: str) -> Any | None:
@@ -32,7 +42,16 @@ class Cache:
         if time.time() - ts > self._ttl:
             del self._store[key]
             return None
+        # Mark as recently used by re-inserting at the end.
+        del self._store[key]
+        self._store[key] = (ts, value)
         return value
 
     def set(self, key: str, value: Any) -> None:
+        if key in self._store:
+            del self._store[key]
         self._store[key] = (time.time(), value)
+        # Evict the oldest (front of dict) until we're back under the cap.
+        while len(self._store) > self._max_size:
+            oldest_key = next(iter(self._store))
+            del self._store[oldest_key]
