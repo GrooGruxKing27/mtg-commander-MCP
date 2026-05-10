@@ -12,6 +12,7 @@ from mtg_commander_mcp.clients.archidekt import ArchidektClient, ArchidektError
 from mtg_commander_mcp.clients.moxfield import MoxfieldClient, MoxfieldError
 from mtg_commander_mcp.clients.rules import RulesClient, RulesError
 from mtg_commander_mcp.clients.delver import DelverClient, DelverError
+from mtg_commander_mcp.clients.mtgjson import MTGJSONClient, MTGJSONError
 from mtg_commander_mcp import collection as col_lib
 from mtg_commander_mcp import storage
 
@@ -23,6 +24,7 @@ archidekt = ArchidektClient()
 moxfield = MoxfieldClient()
 rules = RulesClient()
 delver = DelverClient()
+mtgjson = MTGJSONClient()
 
 
 # ---------------------------------------------------------------------------
@@ -1242,47 +1244,130 @@ async def _price_buy_list(
 
 
 async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
-    """Default-printing pricing via batched ``/cards/collection``.
+    """Default-printing pricing.
 
-    Mirrors the v0.3.0 flow (and ``price_deck``'s resolve-then-fallback
-    pattern at server.py:670) — exact-match batched lookup, then
-    per-card fuzzy fallback for the not-found list and for cards
-    whose default printing carries no USD price.
+    Two-tier lookup: try MTGJSON's local SQLite cache first (when the
+    buy-list entry carries a ``scryfall_id`` and the cache is fresh),
+    fall back to Scryfall's batched ``/cards/collection`` for misses
+    and entries without a Scryfall ID. Mirrors ``price_deck``'s
+    resolve-then-fallback pattern at server.py:670.
+
+    MTGJSON gives us multi-marketplace prices natively (TCGplayer,
+    Card Kingdom, Cardmarket, Manapool) without network round-trips
+    after first download — a 50-card buy list resolves in ~50ms when
+    fully cache-hit, vs ~3s on the Scryfall path. If the cache is
+    missing, we kick off a background refresh so the next call is
+    fast; this call falls through to Scryfall (unchanged) so the
+    user isn't blocked on a 90s first-time download.
+
+    Output ``unit_price_usd`` field is always TCGplayer USD (or the
+    best available USD provider if TCGplayer doesn't list the
+    printing). ``finish`` reports the cheapest variant chosen
+    (``nonfoil`` / ``foil`` / ``etched``) — relevant for foil
+    precons that are cheaper than their nonfoil promo equivalents.
     """
-    names = list({c["name"] for c in buy_list})
-    try:
-        scryfall_data, not_found = await scryfall.get_collection(names)
-    except ScryfallError as e:
-        return {"items": [], "total_usd": 0.0, "missing": names, "error": str(e)}
+    if not buy_list:
+        return {"items": [], "total_usd": 0.0, "missing": [], "source_breakdown": {}}
 
-    needs_fallback: list[str] = list(not_found)
-    fallback_set = set(needs_fallback)
-    for name in names:
-        sd = scryfall_data.get(name)
-        if sd is None or not (sd.get("prices") or {}).get("usd"):
-            if name not in fallback_set:
-                needs_fallback.append(name)
-                fallback_set.add(name)
-
-    if needs_fallback:
-        sem = asyncio.Semaphore(4)
-
-        async def _one(n: str):
-            async with sem:
-                try:
-                    return n, await scryfall.get_card_price(n)
-                except ScryfallError as e:
-                    return n, e
-
-        for name, fb in await asyncio.gather(*(_one(n) for n in needs_fallback)):
-            if isinstance(fb, ScryfallError):
+    # ----- Phase 1: MTGJSON cache hits (local SQLite, ~1ms each) -----
+    mtgjson_results: dict[int, dict] = {}  # buy_list index -> result
+    mtgjson_available = mtgjson.is_available()
+    if mtgjson_available:
+        for idx, entry in enumerate(buy_list):
+            sid = entry.get("scryfall_id")
+            if not sid:
                 continue
-            scryfall_data[name] = fb
+            best = mtgjson.best_retail_price(sid, prefer="tcgplayer")
+            if best is None:
+                continue
+            price, provider, finish_key = best
+            # finish_key is "normal_usd" / "foil_usd" / "etched_usd"
+            finish = finish_key.split("_", 1)[0]
+            qty = int(entry["quantity"])
+            mtgjson_results[idx] = {
+                "name": entry["name"],
+                "quantity": qty,
+                "set_code": entry.get("set_code"),
+                "set_name": None,
+                "collector_number": entry.get("collector_number"),
+                "scryfall_id": sid,
+                "finish": finish,
+                "unit_price_usd": round(price, 2),
+                "line_total_usd": round(price * qty, 2),
+                "_priced_via": provider,
+            }
+    else:
+        # Cache cold or stale — schedule a background refresh so future
+        # calls are fast. Fire-and-forget; ensure_fresh's internal lock
+        # prevents stampedes from concurrent pricing calls.
+        asyncio.create_task(_mtgjson_background_refresh())
 
+    # ----- Phase 2: Scryfall batched + fuzzy for the rest -----
+    needs_scryfall_indices = [
+        idx for idx in range(len(buy_list)) if idx not in mtgjson_results
+    ]
+    scryfall_data: dict[str, dict] = {}
+    if needs_scryfall_indices:
+        names = list({buy_list[i]["name"] for i in needs_scryfall_indices})
+        try:
+            scryfall_data, not_found = await scryfall.get_collection(names)
+        except ScryfallError as e:
+            # If Scryfall is unreachable, surface what MTGJSON priced and
+            # mark the rest as missing.
+            items_partial = [mtgjson_results[i] for i in sorted(mtgjson_results)]
+            missing_names = [buy_list[i]["name"] for i in needs_scryfall_indices]
+            return {
+                "items": items_partial,
+                "total_usd": round(
+                    sum(i["line_total_usd"] for i in items_partial), 2
+                ),
+                "missing": missing_names,
+                "error": str(e),
+                "source_breakdown": {
+                    "mtgjson": len(items_partial),
+                    "scryfall": 0,
+                    "missing": len(missing_names),
+                },
+            }
+
+        needs_fallback: list[str] = list(not_found)
+        fallback_set = set(needs_fallback)
+        for name in names:
+            sd = scryfall_data.get(name)
+            if sd is None or not (sd.get("prices") or {}).get("usd"):
+                if name not in fallback_set:
+                    needs_fallback.append(name)
+                    fallback_set.add(name)
+
+        if needs_fallback:
+            sem = asyncio.Semaphore(4)
+
+            async def _one(n: str):
+                async with sem:
+                    try:
+                        return n, await scryfall.get_card_price(n)
+                    except ScryfallError as e:
+                        return n, e
+
+            for name, fb in await asyncio.gather(*(_one(n) for n in needs_fallback)):
+                if isinstance(fb, ScryfallError):
+                    continue
+                scryfall_data[name] = fb
+
+    # ----- Phase 3: assemble items in original buy_list order -----
     total = 0.0
     items: list[dict] = []
     missing: list[str] = []
-    for entry in buy_list:
+    scryfall_hits = 0
+    mtgjson_hits = 0
+    for idx, entry in enumerate(buy_list):
+        if idx in mtgjson_results:
+            item = mtgjson_results[idx]
+            total += item["line_total_usd"]
+            items.append({k: v for k, v in item.items() if not k.startswith("_")})
+            mtgjson_hits += 1
+            continue
+
         name = entry["name"]
         qty = int(entry["quantity"])
         sd = scryfall_data.get(name) or {}
@@ -1304,6 +1389,7 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
                     "line_total_usd": line,
                 }
             )
+            scryfall_hits += 1
         else:
             missing.append(name)
             items.append(
@@ -1322,7 +1408,24 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
         "items": items,
         "total_usd": round(total, 2),
         "missing": missing,
+        "source_breakdown": {
+            "mtgjson": mtgjson_hits,
+            "scryfall": scryfall_hits,
+            "missing": len(missing),
+        },
     }
+
+
+async def _mtgjson_background_refresh() -> None:
+    """Fire-and-forget refresh used when a pricing call observes a
+    cold cache. Errors are logged, not raised — the call that
+    triggered this already has a Scryfall fallback path.
+    """
+    try:
+        result = await mtgjson.ensure_fresh()
+        logger.info("MTGJSON background refresh complete: %s", result)
+    except MTGJSONError as e:
+        logger.warning("MTGJSON background refresh failed: %s", e)
 
 
 async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
@@ -1423,6 +1526,8 @@ async def pull_and_buy_lists(
         list.
       - `buy_list_missing_prices`: names where no priced English paper
         printing was found.
+      - `buy_list_source_breakdown`: `{mtgjson, scryfall, missing}`
+        counts showing which backend priced each card.
       - `over_commit_warnings`: [{name, requested, owned,
         committed_other_decks}] — name-level signal that the new deck
         wants a card you've already over-allocated.
@@ -1532,8 +1637,61 @@ async def pull_and_buy_lists(
         "buy_list": pricing["items"],
         "buy_list_total_usd": pricing["total_usd"],
         "buy_list_missing_prices": pricing["missing"],
+        "buy_list_source_breakdown": pricing.get("source_breakdown"),
         "over_commit_warnings": allocation["over_commit_warnings"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Pricing Cache Tool
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def refresh_pricing_data(force: bool = False) -> dict:
+    """Refresh the local MTGJSON pricing cache.
+
+    Downloads (or rebuilds, if older than the freshness window):
+      * ``prices.sqlite`` (~132 MB, daily refresh) — every printing's
+        latest price across TCGplayer, Card Kingdom, Cardmarket,
+        Manapool, Cardhoarder.
+      * ``identifiers.sqlite`` (built from ``AllIdentifiers.json.bz2``,
+        ~145 MB compressed; monthly refresh) — Scryfall UUID →
+        MTGJSON UUID mapping so the other tools can look up by the
+        Scryfall ID they already have.
+
+    On a cold cache the full first-time refresh takes ~60-90 seconds
+    (download dominates). Subsequent daily refreshes are ~30 seconds
+    (prices only). Cache lives at
+    ``$XDG_CACHE_HOME/mtg-commander-mcp/`` (defaults to
+    ``~/.cache/mtg-commander-mcp/``).
+
+    Once the cache is populated, ``pull_and_buy_lists`` and
+    ``price_deck`` (future) prefer it over Scryfall — buy-list
+    pricing for a 50-card deck drops from ~3s to ~50ms.
+
+    Args:
+        force: re-download even if the cache is fresh. Useful for
+               grabbing intraday updates (MTGJSON publishes the
+               daily snapshot around 06:10 UTC).
+    """
+    try:
+        result = await mtgjson.ensure_fresh(force=force)
+        return {"status": "ok", **result, "cache_info": mtgjson.cache_info()}
+    except MTGJSONError as e:
+        return {"status": "error", "error": str(e), "cache_info": mtgjson.cache_info()}
+
+
+@mcp.tool()
+async def pricing_cache_status() -> dict:
+    """Inspect the local MTGJSON pricing cache without modifying it.
+
+    Reports which files exist, their sizes, how old they are, and
+    whether the cache is fresh enough to be used by the buy-list
+    pricer (``pull_and_buy_lists``). Call ``refresh_pricing_data``
+    if ``prices_fresh`` is False.
+    """
+    return mtgjson.cache_info()
 
 
 # ---------------------------------------------------------------------------

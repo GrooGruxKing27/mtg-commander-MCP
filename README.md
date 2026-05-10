@@ -1,6 +1,6 @@
 # MTG Commander MCP Server
 
-A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Provides 17 tools across 6 data sources for card lookup, deck building, price comparison, rules reference, and personal-collection workflows.
+A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Provides 19 tools across 7 data sources for card lookup, deck building, price comparison, rules reference, and personal-collection workflows.
 
 ## Data Sources
 
@@ -12,6 +12,7 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 | **Moxfield** | Deck import from URL (Cloudflare bypass via cloudscraper) |
 | **MTG Comprehensive Rules** | Searchable rules and glossary (auto-downloads latest from Wizards) |
 | **Delver Lens** | Collection import from CSV exports (Delver / Moxfield / TCGPlayer / Deckbox / MTGstand presets) |
+| **MTGJSON** | Daily bulk pricing snapshot — TCGplayer + Card Kingdom + Cardmarket + Manapool + Cardhoarder, local SQLite cache |
 
 ## Tools
 
@@ -34,6 +35,8 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 
 ### Pricing
 - **`price_deck`** - Price a deck from Archidekt/Moxfield on both TCGPlayer and Card Kingdom. Compares total cost and card availability with a recommendation. Uses Scryfall's batched `/cards/collection` endpoint plus 8-way concurrent EDHRec lookups, so a 100-card deck typically prices in ~10–20 s (down from 2–3 minutes in earlier versions). Note: a deck full of edge-case prints can produce a brief request burst that briefly trips Scryfall's per-IP rate limiter; if a follow-on Scryfall-backed tool (`scryfall_card`, `scryfall_search`, `scryfall_rulings`) returns `"Scryfall rate limit exceeded after retries"`, wait ~30 s and retry. (The internal throttle race that used to amplify this was fixed in 0.2.0.)
+- **`refresh_pricing_data`** - Refresh the local MTGJSON pricing cache (~132 MB daily prices snapshot + ~150 MB identifiers map). Call once after install for fast buy-list pricing; subsequent calls auto-refresh on staleness. ~60–90s first download, ~30s daily refresh.
+- **`pricing_cache_status`** - Read-only inspection of the MTGJSON cache state (sizes, ages, freshness flag).
 
 ### Collection (Delver Lens)
 - **`import_collection`** - Import a Magic collection from a Delver Lens CSV export, or any compatible preset (Moxfield, TCGPlayer, Deckbox, MTGstand). Accepts a local file path, http(s):// URL, or pasted CSV text. Auto-detects column variants (Name/Card Name, Quantity/Count, Set Code/Edition, Foil/Printing, Scryfall ID). Resolves names via Scryfall (preferring `scryfall_id` when present). Pass `persist=True` to store as the active collection on disk for the rest of the collection tools.

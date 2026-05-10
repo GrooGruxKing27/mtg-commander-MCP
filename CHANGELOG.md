@@ -5,6 +5,58 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-10 — MTGJSON-backed local pricing
+
+### Added
+- **MTGJSON bulk-pricing client.** New
+  `clients/mtgjson.py` downloads MTGJSON's
+  `AllPricesToday.sqlite` (~132 MB daily snapshot) and builds a
+  local `identifiers.sqlite` from `AllIdentifiers.json.bz2`
+  mapping Scryfall UUIDs → MTGJSON UUIDs. Cache lives at
+  `$XDG_CACHE_HOME/mtg-commander-mcp/` (defaults to
+  `~/.cache/mtg-commander-mcp/`). Lookups are local SQLite reads
+  (~1ms each); buy-list pricing for a 50-card deck drops from
+  ~3s (Scryfall batched) to ~50ms (MTGJSON cache-hit).
+- **Multi-marketplace pricing.** MTGJSON's snapshot covers
+  TCGplayer, Card Kingdom, Cardmarket, Manapool, and Cardhoarder
+  natively. `pull_and_buy_lists` continues to surface TCGplayer
+  USD as the headline price but selects the cheapest finish
+  (nonfoil / foil / etched) automatically — relevant for
+  foil-precon-cheaper-than-promo cases that v0.3.2's default-
+  printing path missed.
+- **`refresh_pricing_data(force=False)`** MCP tool — explicit
+  cache refresh. Daily prices re-download takes ~30s; full
+  first-time download (prices + identifiers) is ~60-90s.
+- **`pricing_cache_status()`** MCP tool — read-only cache
+  inspection (sizes, ages, freshness flags).
+- **Background refresh.** When `pull_and_buy_lists` observes a
+  cold/stale cache, it kicks off a background refresh
+  (fire-and-forget, internally lock-guarded against stampedes)
+  so the next call is fast. The triggering call falls through
+  to Scryfall pricing so the user isn't blocked.
+- **`source_breakdown`** field on the `pull_and_buy_lists`
+  response — `{"mtgjson": n, "scryfall": m, "missing": k}` so
+  the caller can see which backend priced each card.
+
+### Changed
+- **`_price_buy_list_fast`** is now two-tier: MTGJSON first for
+  entries with a `scryfall_id`, Scryfall batched for the rest.
+  Output schema preserved; existing callers see the same fields.
+
+### Notes
+- **No new third-party dependencies.** `bz2` and `sqlite3` are
+  stdlib; HTTP uses the existing `httpx`.
+- **First call after fresh install** still uses the Scryfall
+  path (~3s, unchanged from v0.3.2) while the cache populates
+  in the background. Subsequent calls within 24h use MTGJSON.
+- **Disk footprint** ~277 MB at steady state (132 MB prices +
+  145 MB identifiers SQLite). Identifiers refresh only on
+  Scryfall-ID misses or explicit `refresh_pricing_data(force=True)`.
+- **MTGJSON is a free community resource.** No auth, no API
+  key, no rate limit. We send a polite `User-Agent`.
+- **Card Kingdom natively** sets up the path for `price_deck`
+  to drop its EDHRec-based CK workaround in a future release.
+
 ## [0.3.2] — 2026-05-10 — fix `pull_and_buy_lists` MCP timeout
 
 ### Fixed
