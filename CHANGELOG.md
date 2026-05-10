@@ -5,6 +5,29 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-10 — set-density shopping path on `pull_and_buy_lists`
+
+### Added
+- **`pull_list_set_density`** and **`buy_list_set_density`** fields
+  on `pull_and_buy_lists`. Group the pull/buy lists by `set_code`,
+  sorted by descending count, then ascending set_code for stable
+  ties. Cards inside each bucket are sorted by leading-integer of
+  `collector_number` so a binder ordered by number gets walked
+  in-order. Turns a 39-card pull list across 22 sets into an
+  ordered shopping path — hit the densest physical locations
+  first, minimize binder/box traversal. Empirically: top 4 sets
+  on the reported Muddle workload account for 44% of the pull,
+  so the buckets are real and the ordering matters.
+- **`pull_list_total_count`** and **`buy_list_total_count`** —
+  convenience integer fields summing `quantity` across each list.
+  Saves the caller a `sum(c["quantity"] for c in ...)`.
+
+### Notes
+- Purely additive on the response object — no allocator or pricer
+  changes, no new I/O, no schema removal.
+- Cards without a `set_code` (rare, parser-edge cases) land in an
+  `"unknown"` bucket rather than being dropped silently.
+
 ## [0.4.0] — 2026-05-10 — MTGJSON-backed local pricing
 
 ### Added
