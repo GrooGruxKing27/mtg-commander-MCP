@@ -286,69 +286,6 @@ class ScryfallClient:
         self._cache.set(cache_key, (result, not_found))
         return result, not_found
 
-    async def get_cheapest_printing(self, name: str) -> dict | None:
-        """Return the cheapest English paper printing of `name`.
-
-        Considers both non-foil and foil prices (precon commanders are
-        often cheaper as foil than the nonfoil variant). Filters:
-          * ``lang:en`` — English only
-          * ``game:paper`` — exclude MTGO/Arena-only printings
-          * ``-is:oversized`` — exclude commander oversized cards
-          * ``-is:artseries`` — exclude art-series cards
-          * has at least one of usd/usd_foil > 0
-
-        For each candidate, picks the smaller of ``prices.usd`` and
-        ``prices.usd_foil`` and reports it (with which finish won) so
-        the buy list points the user at the actually-cheapest variant,
-        not just the nonfoil. Returns None if no qualifying printing
-        exists.
-        """
-        query = (
-            f'!"{name}" lang:en game:paper '
-            f"(usd>0 or usd_foil>0) "
-            f"-is:oversized -is:artseries"
-        )
-        try:
-            data = await self._fetch(
-                "/cards/search",
-                params={"q": query, "unique": "prints"},
-            )
-        except ScryfallError:
-            return None
-
-        best: tuple[float, str, dict] | None = None
-        for card in data.get("data", []):
-            prices = card.get("prices") or {}
-            candidates: list[tuple[float, str]] = []
-            for field, finish in (("usd", "nonfoil"), ("usd_foil", "foil")):
-                val = prices.get(field)
-                if not val:
-                    continue
-                try:
-                    candidates.append((float(val), finish))
-                except (TypeError, ValueError):
-                    continue
-            if not candidates:
-                continue
-            price, finish = min(candidates)
-            if best is None or price < best[0]:
-                best = (price, finish, card)
-
-        if best is None:
-            return None
-        price, finish, card = best
-        return {
-            "name": card.get("name"),
-            "set_code": (card.get("set") or "").lower() or None,
-            "set_name": card.get("set_name"),
-            "collector_number": card.get("collector_number"),
-            "scryfall_id": card.get("id"),
-            "usd": price,
-            "finish": finish,
-            "scryfall_uri": card.get("scryfall_uri"),
-            "purchase_uris": card.get("purchase_uris"),
-        }
-
     async def get_card_price(self, name: str) -> dict:
         """Get pricing info for a card, finding a printing with prices if the default lacks them."""
         data = await self._fetch("/cards/named", params={"fuzzy": name})

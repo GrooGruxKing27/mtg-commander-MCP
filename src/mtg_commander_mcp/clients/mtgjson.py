@@ -12,11 +12,15 @@ Bulk-data backend for buy-list pricing. Two cached artifacts at
   across TCGplayer, Card Kingdom, Cardmarket, Manapool, Cardhoarder.
 * **``identifiers.sqlite``** — locally built from MTGJSON's
   ``AllIdentifiers.json.bz2`` (≈145 MB compressed) once. Single
-  table ``scryfall_to_mtgjson(scryfall_id, mtgjson_uuid)`` with
-  index on ``scryfall_id``. Maps Scryfall UUIDs (what our other
-  tools already carry) to MTGJSON UUIDs (what ``prices.sqlite`` is
-  keyed by). Rebuilt on demand when a lookup misses — new printings
-  appear weekly, so monthly rebuilds are sufficient.
+  table ``printings(mtgjson_uuid, scryfall_id, name, set_code,
+  set_name, collector_number, language, is_paper)`` filtered to
+  English paper at insert time, with indexes on ``scryfall_id`` and
+  ``LOWER(name)``. The Scryfall-ID index supports the existing
+  ``lookup_price`` path; the name index supports
+  ``cheapest_per_marketplace`` for buy-list pricing without a
+  Scryfall round-trip per card. Rebuilt on demand when a lookup
+  misses or when the schema is older than the running version —
+  new printings appear weekly, so monthly rebuilds are sufficient.
 
 Refresh policy:
 
@@ -103,12 +107,45 @@ class MTGJSONClient:
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
-        """Both caches exist and prices are fresh enough to use."""
+        """Both caches exist, prices are fresh, and the identifiers
+        cache is on the current schema (has the ``printings`` table).
+        Pre-0.5.0 caches with the old ``scryfall_to_mtgjson`` table
+        return False so callers fall back to the network path while
+        ``ensure_fresh()`` rebuilds in the background.
+        """
         return (
             self._prices_path.exists()
             and self._identifiers_path.exists()
             and self._prices_age_seconds() <= PRICES_MAX_AGE_SECONDS
+            and self._identifiers_schema_ok()
         )
+
+    def _identifiers_schema_ok(self) -> bool:
+        """Probe the identifiers DB for the v0.5.0 ``printings`` table.
+
+        Returns False if the file exists but predates the schema change
+        (so it'll be rebuilt on next ``ensure_fresh``). Caches a
+        positive result so the probe is cheap on the hot path.
+        """
+        if not self._identifiers_path.exists():
+            return False
+        if getattr(self, "_identifiers_schema_cached", False):
+            return True
+        try:
+            conn = sqlite3.connect(self._identifiers_path)
+            try:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='printings'"
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return False
+        ok = row is not None
+        if ok:
+            self._identifiers_schema_cached = True
+        return ok
 
     def cache_info(self) -> dict:
         """Snapshot of cache state for diagnostic / refresh tools."""
@@ -165,6 +202,7 @@ class MTGJSONClient:
             if (
                 force
                 or not self._identifiers_path.exists()
+                or not self._identifiers_schema_ok()
                 or (
                     time.time() - self._identifiers_path.stat().st_mtime
                 ) > IDENTIFIERS_MAX_AGE_SECONDS
@@ -210,7 +248,7 @@ class MTGJSONClient:
             return None
 
         row = ids_conn.execute(
-            "SELECT mtgjson_uuid FROM scryfall_to_mtgjson WHERE scryfall_id = ?",
+            "SELECT mtgjson_uuid FROM printings WHERE scryfall_id = ?",
             (scryfall_id,),
         ).fetchone()
         if row is None:
@@ -295,6 +333,114 @@ class MTGJSONClient:
 
         return None
 
+    # Marketplaces we expose USD prices for in the per-card cheapest-
+    # marketplace path. Cardmarket is EUR and intentionally excluded —
+    # mixing currencies in one optimization is misleading. Order is the
+    # tie-break preference (TCGplayer wins ties because that's where the
+    # rest of the buy list is most likely already going).
+    USD_MARKETPLACES = ("tcgplayer", "cardkingdom", "manapool")
+
+    def cheapest_per_marketplace(self, name: str) -> dict | None:
+        """Cheapest English-paper printing of ``name`` at each tracked
+        USD marketplace.
+
+        Returns ``{provider: {set_code, set_name, collector_number,
+        scryfall_id, finish, mtgjson_uuid, unit_price_usd} | None}``
+        for each provider in ``USD_MARKETPLACES`` — ``None`` for any
+        shop that doesn't carry the card. Returns ``None`` if either
+        cache is missing or the name has no English-paper printings
+        indexed at all.
+
+        Within each provider, picks the min across (nonfoil, foil,
+        etched) finishes per printing, then the cheapest printing
+        across all printings of the card. Entirely from local SQLite
+        (~1ms per name) — no Scryfall round-trips, so a 50-card buy
+        list resolves in well under a second instead of hitting the
+        MCP 60s timeout.
+        """
+        if not self.is_available():
+            return None
+
+        ids_conn = self._get_identifiers_conn()
+        prices_conn = self._get_prices_conn()
+        if ids_conn is None or prices_conn is None:
+            return None
+
+        # Single JOIN: every paper-retail USD row for every English-paper
+        # printing of this name. Index on LOWER(name) keeps the printings
+        # side fast; the prices side hits the `uuid` index.
+        rows = ids_conn.execute(
+            "SELECT p.mtgjson_uuid, p.scryfall_id, p.set_code, p.set_name,"
+            "       p.collector_number"
+            " FROM printings p"
+            " WHERE LOWER(p.name) = LOWER(?)"
+            "   AND p.is_paper = 1"
+            "   AND p.language = 'English'",
+            (name,),
+        ).fetchall()
+        if not rows:
+            return None
+
+        # Map uuid -> (scryfall_id, set_code, set_name, collector_number)
+        printing_meta: dict[str, tuple[str | None, str, str | None, str | None]] = {
+            r[0]: (r[1], r[2], r[3], r[4]) for r in rows
+        }
+        uuids = list(printing_meta.keys())
+
+        # Pull all relevant price rows in one query. Use a parameterized
+        # IN clause; SQLite handles up to ~999 placeholders, well above
+        # the ~dozen printings any single card has.
+        placeholders = ",".join("?" * len(uuids))
+        provider_placeholders = ",".join("?" * len(self.USD_MARKETPLACES))
+        price_rows = prices_conn.execute(
+            f"SELECT uuid, provider, finish, price"
+            f" FROM prices"
+            f" WHERE uuid IN ({placeholders})"
+            f"   AND source = 'paper' AND priceType = 'retail'"
+            f"   AND currency = 'USD'"
+            f"   AND provider IN ({provider_placeholders})",
+            (*uuids, *self.USD_MARKETPLACES),
+        ).fetchall()
+        if not price_rows:
+            # Card is indexed but no USD paper price at any tracked shop.
+            # Treat as "no shop carries it" — the caller will surface it
+            # in the missing list.
+            return {p: None for p in self.USD_MARKETPLACES}
+
+        # For each (provider, uuid), keep the min price across finishes.
+        # Then for each provider, pick the global-min printing.
+        best_by_provider: dict[str, tuple[float, str, str]] = {}
+        # ^ provider -> (price, uuid, finish)
+        for uuid, provider, finish, price in price_rows:
+            try:
+                price_f = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price_f <= 0:
+                continue
+            current = best_by_provider.get(provider)
+            if current is None or price_f < current[0]:
+                best_by_provider[provider] = (price_f, uuid, finish)
+
+        result: dict[str, dict | None] = {}
+        for provider in self.USD_MARKETPLACES:
+            best = best_by_provider.get(provider)
+            if best is None:
+                result[provider] = None
+                continue
+            price_f, uuid, finish = best
+            sid, set_code, set_name, collector_number = printing_meta[uuid]
+            result[provider] = {
+                "mtgjson_uuid": uuid,
+                "scryfall_id": sid,
+                "set_code": set_code,
+                "set_name": set_name,
+                "collector_number": collector_number,
+                "finish": finish,
+                "unit_price_usd": round(price_f, 2),
+            }
+        return result
+
     def close(self) -> None:
         """Close cached SQLite connections and the HTTP client. Safe
         to call multiple times."""
@@ -363,6 +509,9 @@ class MTGJSONClient:
             except Exception:
                 pass
             self._identifiers_conn = None
+        # Force re-probe of the schema flag against whatever file is on
+        # disk after a refresh swap.
+        self._identifiers_schema_cached = False
 
     async def _download_prices(self) -> dict:
         """Fetch AllPricesToday.sqlite to a tempfile, validate, swap in."""
@@ -409,9 +558,14 @@ class MTGJSONClient:
             raise MTGJSONError(f"prices download failed: {e}") from e
 
     async def _download_identifiers(self) -> dict:
-        """Fetch AllIdentifiers.json.bz2, extract scryfall_id →
-        mtgjson_uuid pairs, build a SQLite mapping. Total work is
-        ~30s wall (dominated by the 145 MB download).
+        """Fetch AllIdentifiers.json.bz2, build the printings table.
+
+        Captures name / set_code / set_name / collector_number /
+        language / is_paper alongside the scryfall_id ↔ mtgjson_uuid
+        mapping so name-keyed lookups (cheapest_per_marketplace) can
+        run entirely against local SQLite. Filters to English paper
+        at insert time to keep the index small. Total work is ~30s
+        wall (dominated by the 145 MB download).
         """
         t0 = time.monotonic()
         logger.info("MTGJSON: downloading identifiers from %s", IDENTIFIERS_URL)
@@ -439,25 +593,63 @@ class MTGJSONClient:
                 conn.execute("PRAGMA journal_mode = OFF")
                 conn.execute("PRAGMA synchronous = OFF")
                 conn.execute(
-                    "CREATE TABLE scryfall_to_mtgjson "
-                    "(scryfall_id TEXT PRIMARY KEY, mtgjson_uuid TEXT NOT NULL)"
+                    "CREATE TABLE printings ("
+                    "  mtgjson_uuid     TEXT PRIMARY KEY,"
+                    "  scryfall_id      TEXT,"
+                    "  name             TEXT NOT NULL,"
+                    "  set_code         TEXT NOT NULL,"
+                    "  set_name         TEXT,"
+                    "  collector_number TEXT,"
+                    "  language         TEXT,"
+                    "  is_paper         INTEGER NOT NULL"
+                    ")"
                 )
                 rows = []
+                skipped_non_paper = 0
                 for mtgjson_uuid, entry in cards.items():
+                    name = entry.get("name")
+                    set_code = entry.get("setCode")
+                    if not name or not set_code:
+                        continue
+                    availability = entry.get("availability") or []
+                    is_paper = 1 if "paper" in availability else 0
+                    language = entry.get("language") or "English"
+                    # Filter to English paper at insert time. Non-English
+                    # printings and digital-only cards bloat the index
+                    # without ever being picked by the buy-list path.
+                    if not is_paper or language != "English":
+                        skipped_non_paper += 1
+                        continue
                     sid = (entry.get("identifiers") or {}).get("scryfallId")
-                    if sid:
-                        rows.append((sid, mtgjson_uuid))
-                # Use INSERT OR IGNORE: MTGJSON has rare edge-cases
-                # where two MTGJSON UUIDs map to the same scryfallId
-                # (alternative-art / proxy promos). First write wins;
-                # the alternative just won't be price-able via this
-                # mapping and falls back to Scryfall.
+                    rows.append((
+                        mtgjson_uuid,
+                        sid,
+                        name,
+                        set_code,
+                        entry.get("setName"),
+                        entry.get("number"),
+                        language,
+                        is_paper,
+                    ))
+                # INSERT OR IGNORE: MTGJSON has rare edge-cases where two
+                # MTGJSON UUIDs map to the same scryfall_id (alternative-
+                # art / proxy promos). The PRIMARY KEY is mtgjson_uuid so
+                # collisions there shouldn't happen, but keep the IGNORE
+                # as a belt for any duplicate UUID in the source JSON.
                 conn.executemany(
-                    "INSERT OR IGNORE INTO scryfall_to_mtgjson VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO printings "
+                    "(mtgjson_uuid, scryfall_id, name, set_code, set_name,"
+                    " collector_number, language, is_paper)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
                 conn.execute(
-                    "CREATE INDEX idx_scryfall_id ON scryfall_to_mtgjson(scryfall_id)"
+                    "CREATE INDEX idx_printings_scryfall "
+                    "ON printings(scryfall_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX idx_printings_name_lower "
+                    "ON printings(LOWER(name))"
                 )
                 conn.commit()
             finally:
@@ -467,9 +659,11 @@ class MTGJSONClient:
             tmp_archive.unlink(missing_ok=True)
             elapsed = time.monotonic() - t0
             logger.info(
-                "MTGJSON: identifiers rebuilt in %.1fs (%d mappings)",
+                "MTGJSON: identifiers rebuilt in %.1fs (%d printings, "
+                "%d non-English/digital skipped)",
                 elapsed,
                 len(rows),
+                skipped_non_paper,
             )
             return {
                 "action": "downloaded",
