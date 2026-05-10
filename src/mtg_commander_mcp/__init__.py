@@ -1,7 +1,7 @@
 import logging as _logging
 import sys as _sys
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 # Configure a stderr handler at WARNING for the package on first import,
 # unless the embedding application has already set up logging. This makes
