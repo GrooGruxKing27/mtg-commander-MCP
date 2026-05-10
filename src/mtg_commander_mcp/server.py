@@ -1209,37 +1209,49 @@ def _serialize_printing_inv(
 async def _price_buy_list(
     buy_list: list[dict], *, cheapest_printing: bool = False
 ) -> dict:
-    """Price a buy list. Two modes:
+    """Price a buy list. Two modes for the flat ``items`` list:
 
     * **Fast (default).** Batched ``/cards/collection`` lookup (75
       names per POST) → 1-2 Scryfall round-trips for any reasonable
       buy list, fuzzy-fallback for misses. Returns Scryfall's default
       printing's price for each card. ~3-7s wall-clock cold.
     * **Cheapest-marketplace (opt-in via ``cheapest_printing=True``).**
-      Per-card cheapest English-paper printing across TCGplayer / Card
-      Kingdom / Manapool, grouped by winning shop. MTGJSON-backed
-      (local SQLite, no per-card HTTP), so a 50-card buy list resolves
-      in ~50ms instead of risking a 60s MCP timeout. Adds a
-      ``by_marketplace`` field to the response so the buy list reads
-      as a per-shop shopping list. Cardmarket (EUR) excluded from this
-      mode to keep totals USD-only.
+      Each flat item is the per-card cheapest English-paper printing
+      across TCGplayer / Card Kingdom / Manapool, carrying a
+      ``marketplace`` field with its winning shop. MTGJSON-backed
+      (local SQLite, no per-card HTTP) — a 50-card buy list resolves
+      in ~50ms.
 
-    Output schema across modes: every priced row has ``set_code``,
+    Always-populated views (built from the MTGJSON cache, independent
+    of mode):
+
+    * ``by_marketplace`` — dict keyed by marketplace name, each entry
+      ``{total_usd, cards_priced, cards_unavailable,
+      cards_unavailable_count}``. Tells the caller what it'd cost to
+      order *everything* from one shop and what that shop is missing.
+    * ``optimal_split`` — per-card cheapest-marketplace selection with
+      ``savings_vs_cheapest_single_marketplace`` and per-shop card
+      counts. Floor on the deck's possible cost, ignoring shipping.
+
+    Both are ``None`` when the MTGJSON cache is cold/stale (a
+    background refresh is kicked off so the next call has the views).
+    Cardmarket (EUR) and Cardhoarder (MTGO tix) are intentionally
+    omitted to keep all totals USD paper.
+
+    Output schema for flat rows: every priced row has ``set_code``,
     ``set_name``, ``collector_number``, ``scryfall_id``, ``finish``,
     ``unit_price_usd``, ``line_total_usd``. Cheapest mode adds a
-    ``marketplace`` field to each row plus the top-level
-    ``by_marketplace`` grouping. In fast mode finish defaults to
+    ``marketplace`` field to each row. In fast mode finish defaults to
     ``"nonfoil"``.
-
-    The fast default reverses the v0.3.1 design (always-cheapest)
-    after empirical timing showed Scryfall-search-based cheapest mode
-    couldn't fit in the MCP request budget. v0.5.0 made cheapest mode
-    MTGJSON-first and reframed it around per-card marketplace selection
-    so it both fits in the budget AND answers the actually-useful
-    question ("where do I buy this?").
     """
     if not buy_list:
-        return {"items": [], "total_usd": 0.0, "missing": []}
+        return {
+            "items": [],
+            "total_usd": 0.0,
+            "missing": [],
+            "by_marketplace": {},
+            "optimal_split": None,
+        }
 
     if cheapest_printing:
         return await _price_buy_list_cheapest(buy_list)
@@ -1270,7 +1282,14 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
     precons that are cheaper than their nonfoil promo equivalents.
     """
     if not buy_list:
-        return {"items": [], "total_usd": 0.0, "missing": [], "source_breakdown": {}}
+        return {
+            "items": [],
+            "total_usd": 0.0,
+            "missing": [],
+            "by_marketplace": {},
+            "optimal_split": None,
+            "source_breakdown": {},
+        }
 
     # ----- Phase 1: MTGJSON cache hits (local SQLite, ~1ms each) -----
     mtgjson_results: dict[int, dict] = {}  # buy_list index -> result
@@ -1316,9 +1335,15 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
             scryfall_data, not_found = await scryfall.get_collection(names)
         except ScryfallError as e:
             # If Scryfall is unreachable, surface what MTGJSON priced and
-            # mark the rest as missing.
+            # mark the rest as missing. Per-marketplace views are
+            # MTGJSON-only, so still attempt them even though the flat
+            # list is partial — the user can still make a "where do I
+            # buy" decision from what the local cache knows.
             items_partial = [mtgjson_results[i] for i in sorted(mtgjson_results)]
             missing_names = [buy_list[i]["name"] for i in needs_scryfall_indices]
+            views_partial = (
+                _build_marketplace_views(buy_list) if mtgjson_available else None
+            )
             return {
                 "items": items_partial,
                 "total_usd": round(
@@ -1326,6 +1351,12 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
                 ),
                 "missing": missing_names,
                 "error": str(e),
+                "by_marketplace": (
+                    views_partial["by_marketplace"] if views_partial else None
+                ),
+                "optimal_split": (
+                    views_partial["optimal_split"] if views_partial else None
+                ),
                 "source_breakdown": {
                     "mtgjson": len(items_partial),
                     "scryfall": 0,
@@ -1407,10 +1438,21 @@ async def _price_buy_list_fast(buy_list: list[dict]) -> dict:
                 }
             )
 
+    # Per-marketplace views are MTGJSON-only and orthogonal to the
+    # flat list above: even in fast mode (where the flat list is
+    # Scryfall's default printing per card), give the caller the same
+    # per-shop totals and per-card cheapest-split that cheapest mode
+    # surfaces. The marketplace view is a separate question from
+    # "what's a single representative price for each card" and the
+    # caller shouldn't have to flip a mode flag to get it.
+    views = _build_marketplace_views(buy_list) if mtgjson_available else None
+
     return {
         "items": items,
         "total_usd": round(total, 2),
         "missing": missing,
+        "by_marketplace": views["by_marketplace"] if views else None,
+        "optimal_split": views["optimal_split"] if views else None,
         "source_breakdown": {
             "mtgjson": mtgjson_hits,
             "scryfall": scryfall_hits,
@@ -1431,20 +1473,184 @@ async def _mtgjson_background_refresh() -> None:
         logger.warning("MTGJSON background refresh failed: %s", e)
 
 
+def _build_marketplace_views(buy_list: list[dict]) -> dict | None:
+    """Build the per-marketplace whole-deck view and the optimal-split
+    view from a buy list, using the local MTGJSON cache.
+
+    Returns ``None`` when the MTGJSON cache is unavailable (caller is
+    responsible for surfacing the cache-cold state to the user — per-
+    marketplace data is MTGJSON-only, no network fallback).
+
+    Returns a dict shaped::
+
+        {
+          "by_marketplace": {
+            "tcgplayer": {
+              "total_usd": <float>,
+              "cards_priced": <int>,             # sum of quantity
+              "cards_unavailable": [             # cards this shop doesn't list
+                {"name", "set_code", "quantity"}
+              ],
+              "cards_unavailable_count": <int>,  # sum of quantity
+            },
+            "cardkingdom": {...},
+            "manapool": {...},
+          },
+          "optimal_split": {
+            "total_usd": <float>,
+            "cheapest_single_marketplace": "tcgplayer",
+            "cheapest_single_marketplace_total_usd": <float>,
+            "savings_vs_cheapest_single_marketplace": <float>,
+            "marketplaces_used": <int>,
+            "marketplace_card_counts": {provider: card_count, ...},
+            "cards": [
+              {"name", "set_code", "collector_number", "scryfall_id",
+               "finish", "quantity", "marketplace", "unit_price_usd",
+               "line_total_usd"},
+              ...
+            ],
+            "cards_unavailable": [name, ...],
+          },
+        }
+
+    Cardmarket (EUR) and Cardhoarder (MTGO digital tix) are intentionally
+    omitted — mixing currencies / formats in a single optimization
+    misleads the buyer. Both are still queryable via raw
+    ``lookup_price`` if needed.
+    """
+    if not mtgjson.is_available():
+        return None
+
+    # Look up each unique card's per-marketplace cheapest printing once.
+    unique_names = list({c["name"] for c in buy_list})
+    per_card: dict[str, dict | None] = {
+        n: mtgjson.cheapest_per_marketplace(n) for n in unique_names
+    }
+
+    providers = mtgjson.USD_MARKETPLACES
+
+    # --- Per-marketplace whole-deck view ---
+    # For each marketplace, sum what it'd cost to buy every buy-list card
+    # there (using each shop's own cheapest English-paper printing). Cards
+    # not carried by a shop go into that shop's `cards_unavailable`.
+    by_marketplace: dict[str, dict] = {}
+    for provider in providers:
+        total = 0.0
+        cards_priced = 0
+        cards_unavailable: list[dict] = []
+        for entry in buy_list:
+            name = entry["name"]
+            qty = int(entry.get("quantity", 1))
+            offers = per_card.get(name) or {}
+            offer = offers.get(provider)
+            if offer is None:
+                cards_unavailable.append(
+                    {
+                        "name": name,
+                        "set_code": entry.get("set_code"),
+                        "quantity": qty,
+                    }
+                )
+                continue
+            total += float(offer["unit_price_usd"]) * qty
+            cards_priced += qty
+        by_marketplace[provider] = {
+            "total_usd": round(total, 2),
+            "cards_priced": cards_priced,
+            "cards_unavailable": cards_unavailable,
+            "cards_unavailable_count": sum(
+                int(c["quantity"]) for c in cards_unavailable
+            ),
+        }
+
+    # --- Optimal-split view: per-card cheapest USD marketplace ---
+    # Tie-break by USD_MARKETPLACES order (tcgplayer > cardkingdom >
+    # manapool) so output is deterministic and consolidates ties at the
+    # most-likely-already-being-used shop.
+    split_total = 0.0
+    split_cards: list[dict] = []
+    split_unavailable: list[str] = []
+    split_counts: dict[str, int] = {p: 0 for p in providers}
+    for entry in buy_list:
+        name = entry["name"]
+        qty = int(entry.get("quantity", 1))
+        offers = per_card.get(name) or {}
+        winner: tuple[str, dict] | None = None
+        for provider in providers:
+            offer = offers.get(provider)
+            if offer is None:
+                continue
+            if (
+                winner is None
+                or offer["unit_price_usd"] < winner[1]["unit_price_usd"]
+            ):
+                winner = (provider, offer)
+        if winner is None:
+            split_unavailable.append(name)
+            continue
+        marketplace, offer = winner
+        unit = float(offer["unit_price_usd"])
+        line = round(unit * qty, 2)
+        split_total += line
+        split_counts[marketplace] += qty
+        split_cards.append(
+            {
+                "name": name,
+                "quantity": qty,
+                "set_code": offer["set_code"],
+                "set_name": offer.get("set_name"),
+                "collector_number": offer["collector_number"],
+                "scryfall_id": offer.get("scryfall_id"),
+                "finish": offer.get("finish"),
+                "marketplace": marketplace,
+                "unit_price_usd": round(unit, 2),
+                "line_total_usd": line,
+            }
+        )
+
+    # Savings: compare against the cheapest single-marketplace total
+    # *among marketplaces that actually carry every card the split priced*.
+    # Mixing a marketplace that's missing 10 of 48 cards into the single-
+    # marketplace baseline would understate the savings dishonestly.
+    eligible_singles = {
+        p: v["total_usd"]
+        for p, v in by_marketplace.items()
+        if v["cards_unavailable_count"] == 0
+    }
+    if eligible_singles:
+        cheapest_single, cheapest_single_total = min(
+            eligible_singles.items(), key=lambda kv: kv[1]
+        )
+        savings = round(cheapest_single_total - split_total, 2)
+    else:
+        cheapest_single = None
+        cheapest_single_total = None
+        savings = None
+
+    return {
+        "by_marketplace": by_marketplace,
+        "optimal_split": {
+            "total_usd": round(split_total, 2),
+            "cheapest_single_marketplace": cheapest_single,
+            "cheapest_single_marketplace_total_usd": cheapest_single_total,
+            "savings_vs_cheapest_single_marketplace": savings,
+            "marketplaces_used": sum(1 for c in split_counts.values() if c > 0),
+            "marketplace_card_counts": {
+                p: c for p, c in split_counts.items() if c > 0
+            },
+            "cards": split_cards,
+            "cards_unavailable": split_unavailable,
+        },
+    }
+
+
 async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
-    """Per-card cheapest-marketplace pricing, grouped by winning shop.
+    """Per-card cheapest-marketplace pricing.
 
-    For each unique buy-list card, finds the cheapest English-paper
-    printing at each of TCGplayer / Card Kingdom / Manapool via the
-    local MTGJSON cache (no Scryfall round-trips), then picks the
-    marketplace with the lowest unit price. Tie-break preference:
-    TCGplayer > Card Kingdom > Manapool — keeps results deterministic
-    and consolidates ties at the most-likely-already-being-used shop.
-
-    The response carries both a flat ``items`` list (each item carries
-    its winning ``marketplace``) and a ``by_marketplace`` grouping
-    with per-shop subtotals — so the buy list literally reads
-    "buy these N cards from shop X for $Y."
+    The flat ``items`` list is the optimal-split flattened — each item
+    carries its winning ``marketplace``. ``by_marketplace`` and
+    ``optimal_split`` (built by ``_build_marketplace_views``) are
+    surfaced verbatim by the caller.
 
     Cache cold or stale → returns an empty result with all cards in
     ``missing``, after kicking off a background refresh. Per-marketplace
@@ -1457,15 +1663,15 @@ async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
             "items": [],
             "total_usd": 0.0,
             "missing": [],
-            "by_marketplace": [],
+            "by_marketplace": {},
+            "optimal_split": None,
             "source_breakdown": {"mtgjson": 0, "scryfall": 0, "missing": 0},
         }
 
-    if not mtgjson.is_available():
-        # Cache cold/stale or schema out of date. Per-marketplace data
-        # is MTGJSON-only — no network fallback. Kick off a refresh so
-        # the next call works, and surface every card as missing with a
-        # clear hint.
+    views = _build_marketplace_views(buy_list)
+    if views is None:
+        # Cache cold/stale or schema out of date. Kick off a refresh so
+        # the next call works, and surface every card as missing.
         asyncio.create_task(_mtgjson_background_refresh())
         return {
             "items": [
@@ -1482,7 +1688,8 @@ async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
             ],
             "total_usd": 0.0,
             "missing": [c["name"] for c in buy_list],
-            "by_marketplace": [],
+            "by_marketplace": None,
+            "optimal_split": None,
             "source_breakdown": {
                 "mtgjson": 0,
                 "scryfall": 0,
@@ -1496,27 +1703,21 @@ async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
             ),
         }
 
-    # Look up each unique card's per-marketplace cheapest printing.
-    unique_names = list({c["name"] for c in buy_list})
-    per_card: dict[str, dict | None] = {
-        n: mtgjson.cheapest_per_marketplace(n) for n in unique_names
-    }
+    split = views["optimal_split"]
+    priced_by_name: dict[str, dict] = {c["name"]: c for c in split["cards"]}
 
-    # Per-card winner: pick the marketplace whose cheapest printing is
-    # the lowest unit price. USD_MARKETPLACES is iterated in tie-break
-    # preference order (tcgplayer > cardkingdom > manapool), and we keep
-    # the current best only if a strictly-lower price beats it.
+    # Flat items list, in original buy_list order, using the optimal
+    # split's per-card winning marketplace. Cards the split couldn't
+    # price (not carried by any USD shop) get None fields and go on the
+    # missing list.
     items: list[dict] = []
     missing: list[str] = []
-    grouped: dict[str, list[dict]] = {p: [] for p in mtgjson.USD_MARKETPLACES}
-    grouped_subtotals: dict[str, float] = {p: 0.0 for p in mtgjson.USD_MARKETPLACES}
     grand_total = 0.0
-
     for entry in buy_list:
         name = entry["name"]
         qty = int(entry.get("quantity", 1))
-        offers = per_card.get(name)
-        if not offers or all(v is None for v in offers.values()):
+        picked = priced_by_name.get(name)
+        if picked is None:
             missing.append(name)
             items.append(
                 {
@@ -1530,69 +1731,16 @@ async def _price_buy_list_cheapest(buy_list: list[dict]) -> dict:
                 }
             )
             continue
-
-        winner: tuple[str, dict] | None = None  # (marketplace, offer)
-        for provider in mtgjson.USD_MARKETPLACES:
-            offer = offers.get(provider)
-            if offer is None:
-                continue
-            if winner is None or offer["unit_price_usd"] < winner[1]["unit_price_usd"]:
-                winner = (provider, offer)
-
-        # Defensive: should be unreachable given the all-None check above.
-        if winner is None:
-            missing.append(name)
-            items.append(
-                {
-                    "name": name,
-                    "quantity": qty,
-                    "set_code": entry.get("set_code"),
-                    "collector_number": entry.get("collector_number"),
-                    "scryfall_id": entry.get("scryfall_id"),
-                    "unit_price_usd": None,
-                    "line_total_usd": None,
-                }
-            )
-            continue
-
-        marketplace, offer = winner
-        unit = float(offer["unit_price_usd"])
-        line = round(unit * qty, 2)
-        grand_total += line
-        grouped_subtotals[marketplace] += line
-
-        item = {
-            "name": name,
-            "quantity": qty,
-            "set_code": offer["set_code"],
-            "set_name": offer.get("set_name"),
-            "collector_number": offer["collector_number"],
-            "scryfall_id": offer.get("scryfall_id"),
-            "finish": offer.get("finish"),
-            "marketplace": marketplace,
-            "unit_price_usd": round(unit, 2),
-            "line_total_usd": line,
-        }
-        items.append(item)
-        grouped[marketplace].append(item)
-
-    by_marketplace = [
-        {
-            "marketplace": provider,
-            "subtotal_usd": round(grouped_subtotals[provider], 2),
-            "item_count": sum(int(i["quantity"]) for i in grouped[provider]),
-            "items": grouped[provider],
-        }
-        for provider in mtgjson.USD_MARKETPLACES
-        if grouped[provider]
-    ]
+        grand_total += picked["line_total_usd"]
+        items.append(picked)
 
     priced_count = sum(1 for i in items if i.get("unit_price_usd") is not None)
     return {
         "items": items,
         "total_usd": round(grand_total, 2),
         "missing": missing,
-        "by_marketplace": by_marketplace,
+        "by_marketplace": views["by_marketplace"],
+        "optimal_split": views["optimal_split"],
         "source_breakdown": {
             "mtgjson": priced_count,
             "scryfall": 0,
@@ -1635,21 +1783,40 @@ async def pull_and_buy_lists(
         — cards the new deck needs that aren't in the free pool, with
         TCGPlayer USD pricing.
       - `buy_list_total_count`: sum of `quantity` across the buy list.
-      - `buy_list_set_density`: same shape as `pull_list_set_density`
-        but for the buy list — useful if you batch TCGPlayer orders
-        by seller (sellers concentrate by set).
       - `buy_list_total_usd`: sum of `line_total_usd` across the buy
         list.
       - `buy_list_missing_prices`: names where no priced English paper
         printing was found.
       - `buy_list_source_breakdown`: `{mtgjson, scryfall, missing}`
         counts showing which backend priced each card.
-      - `buy_list_by_marketplace`: only present when
-        ``cheapest_printing=True``. ``[{marketplace, subtotal_usd,
-        item_count, items: [...]}]`` — the buy list grouped by the
-        cheapest USD marketplace (TCGplayer / Card Kingdom / Manapool)
-        per card, so you can place one order per shop. Marketplaces
-        with zero items are omitted.
+      - `buy_list_by_marketplace`: **the primary buy-decision view.**
+        ``{<marketplace>: {total_usd, cards_priced, cards_unavailable,
+        cards_unavailable_count}, ...}`` keyed by marketplace name
+        (TCGplayer, Card Kingdom, Manapool). For each shop, the total
+        is what it would cost to buy *every* buy-list card from that
+        shop alone, using that shop's cheapest English-paper printing;
+        `cards_unavailable` lists what the shop doesn't carry. Lets
+        the user pick a single-shop order with a clear "this shop is
+        missing N cards" caveat. Populated whenever the MTGJSON cache
+        is fresh; `null` when the cache is cold/stale.
+      - `buy_list_optimal_split`: per-card cheapest-marketplace
+        selection across TCGplayer / Card Kingdom / Manapool, with
+        a savings delta vs. the cheapest single-marketplace total.
+        ``{total_usd, cheapest_single_marketplace,
+        cheapest_single_marketplace_total_usd,
+        savings_vs_cheapest_single_marketplace, marketplaces_used,
+        marketplace_card_counts, cards: [...], cards_unavailable: [...]}``.
+        Caveat: per-card optimization ignores shipping cost and seller
+        fragmentation — paying 3× shipping to save $6 on cards is
+        usually a worse outcome than the headline savings number
+        suggests. Useful as a *floor* on what the buy list could cost,
+        not as a literal shopping plan. Populated whenever the MTGJSON
+        cache is fresh; `null` otherwise.
+      - `buy_list_set_density`: same shape as `pull_list_set_density`
+        but for the buy list. Secondary view — useful for binder/box
+        traversal when picking from a single-seller bundle, less useful
+        for deciding *which seller* to order from. For the buy-decision,
+        prefer `buy_list_by_marketplace` and `buy_list_optimal_split`.
       - `over_commit_warnings_count`: integer count of cards that
         appear in more existing decks than you own copies of. Always
         present.
@@ -1671,23 +1838,24 @@ async def pull_and_buy_lists(
     ``match_tier="name"``. Basic lands are skipped by default — most
     Delver users don't track them. Set `include_basics=True` if you do.
 
-    Pricing modes:
+    Pricing modes affect only the flat ``buy_list`` field; the
+    ``buy_list_by_marketplace`` and ``buy_list_optimal_split`` views
+    are populated independently from the MTGJSON cache whenever it's
+    fresh, regardless of mode.
+
       * ``cheapest_printing=False`` (default) — Scryfall's default
         printing per card via batched ``/cards/collection`` (75
         names/POST). ~3-7s wall-clock for any reasonable buy list,
-        comfortably under MCP timeout.
+        comfortably under MCP timeout. Flat ``buy_list`` shows a
+        single representative TCGplayer USD price per card.
       * ``cheapest_printing=True`` — MTGJSON-backed, per-card cheapest
-        marketplace across TCGplayer / Card Kingdom / Manapool, grouped
-        by winning shop. Adds ``buy_list_by_marketplace`` to the
-        response: an ordered list of ``{marketplace, subtotal_usd,
-        item_count, items}`` so the buy list reads as a per-shop
-        shopping list ("buy these N cards from TCGplayer for $X, these
-        M from Card Kingdom for $Y, ..."). Each ``buy_list`` item also
-        carries a ``marketplace`` field. Local SQLite — completes in
-        well under a second even on big buy lists. Requires the MTGJSON
-        cache to be present and on the v0.5.0+ schema; if cold or
-        out-of-date, returns all cards as missing and kicks off a
-        background refresh.
+        marketplace across TCGplayer / Card Kingdom / Manapool. The
+        flat ``buy_list`` becomes the optimal-split flattened: each
+        item carries its winning ``marketplace`` field. Local SQLite —
+        completes in well under a second even on big buy lists.
+        Requires the MTGJSON cache to be present and on the v0.5.0+
+        schema; if cold or out-of-date, returns all cards as missing
+        and kicks off a background refresh.
 
     Args:
         new_deck: deck URL or pasted decklist
@@ -1784,10 +1952,11 @@ async def pull_and_buy_lists(
         "buy_list_total_usd": pricing["total_usd"],
         "buy_list_missing_prices": pricing["missing"],
         "buy_list_source_breakdown": pricing.get("source_breakdown"),
-        # Only present in cheapest-marketplace mode; the fast path
-        # doesn't break out per-shop totals because it always returns
-        # TCGplayer-prefer prices.
+        # Per-marketplace views are MTGJSON-only and orthogonal to
+        # the flat list's pricing mode. Both are surfaced whenever the
+        # local cache is fresh; null when the cache is cold/stale.
         "buy_list_by_marketplace": pricing.get("by_marketplace"),
+        "buy_list_optimal_split": pricing.get("optimal_split"),
         # Always surface the count so the caller knows whether any
         # warnings exist; the full list is opt-in to avoid drowning
         # a typical 60+ deck portfolio's response in informational
