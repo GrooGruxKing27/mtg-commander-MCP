@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 
 from mtg_commander_mcp.utils import Cache, to_slug
@@ -269,3 +271,27 @@ class EDHRecClient:
             "top_commanders": top_commanders[:10],
             "similar_cards": similar_cards,
         }
+
+    async def get_cards_concurrent(
+        self, names: list[str], max_concurrent: int = 8
+    ) -> dict[str, dict]:
+        """Look up many cards in parallel, returning {name: card_data}.
+
+        Uses a semaphore to cap concurrent requests at `max_concurrent` to
+        avoid hammering EDHRec. Cards that 404 or otherwise fail are absent
+        from the result.
+        """
+        if not names:
+            return {}
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def fetch_one(name: str) -> tuple[str, dict | None]:
+            async with sem:
+                try:
+                    return name, await self.get_card(name)
+                except (EDHRecError, httpx.HTTPError):
+                    return name, None
+
+        results = await asyncio.gather(*(fetch_one(n) for n in names))
+        return {name: data for name, data in results if data is not None}

@@ -1,3 +1,5 @@
+import asyncio
+
 from mcp.server.fastmcp import FastMCP
 
 from mtg_commander_mcp.clients.edhrec import EDHRecClient, EDHRecError, VALID_COLOR_FILTERS
@@ -588,6 +590,20 @@ async def price_deck(url: str) -> dict:
                 seen_names.add(name)
                 all_cards.append(card)
 
+    names = [c["name"] for c in all_cards]
+
+    # Fetch Scryfall (batched, 75 cards/POST) and EDHRec (parallel, 8-way) in
+    # parallel. For ~100 cards this is 2 Scryfall requests + ~100 EDHRec
+    # requests (capped at 8 concurrent) instead of 100 sequential round-trips
+    # to each — drops total runtime from ~3 minutes to ~10 seconds.
+    try:
+        scryfall_data, edhrec_data = await asyncio.gather(
+            scryfall.get_collection(names),
+            edhrec.get_cards_concurrent(names),
+        )
+    except ScryfallError as e:
+        return {"error": f"Scryfall lookup failed: {e}"}
+
     tcg_total = 0.0
     ck_total = 0.0
     tcg_available = 0
@@ -596,35 +612,36 @@ async def price_deck(url: str) -> dict:
     ck_missing = []
     card_prices = []
 
+    # Scryfall sometimes returns a default printing without USD pricing
+    # (e.g. promo-only). Track those so we can do a per-card fallback to the
+    # prints-search path that the original implementation used.
+    needs_tcg_fallback: list[str] = []
+
     for card in all_cards:
-        name = card.get("name", "")
+        name = card["name"]
         qty = card.get("quantity", 1)
 
-        # Get Scryfall price (TCGPlayer)
+        # --- TCGPlayer price via Scryfall batch ---
         tcg_price = None
-        try:
-            price_data = await scryfall.get_card_price(name)
-            prices = price_data.get("prices", {})
-            usd = prices.get("usd")
+        sd = scryfall_data.get(name)
+        if sd is not None:
+            usd = (sd.get("prices") or {}).get("usd")
             if usd:
                 tcg_price = float(usd) * qty
                 tcg_total += tcg_price
                 tcg_available += qty
             else:
-                tcg_missing.append(name)
-        except ScryfallError:
-            tcg_missing.append(name)
+                needs_tcg_fallback.append(name)
+        else:
+            needs_tcg_fallback.append(name)
 
-        # Get EDHRec price (Card Kingdom)
+        # --- Card Kingdom price via EDHRec ---
         ck_price = None
-        try:
-            edhrec_card = await edhrec.get_card(name)
-            prices = edhrec_card.get("prices") or {}
+        ed = edhrec_data.get(name)
+        if ed is not None:
+            prices = ed.get("prices") or {}
             ck_data = prices.get("cardkingdom")
-            if isinstance(ck_data, dict):
-                ck_val = ck_data.get("price")
-            else:
-                ck_val = ck_data
+            ck_val = ck_data.get("price") if isinstance(ck_data, dict) else ck_data
             if ck_val is not None:
                 try:
                     ck_price = float(str(ck_val).replace("$", "").replace(",", "")) * qty
@@ -634,7 +651,7 @@ async def price_deck(url: str) -> dict:
                     ck_missing.append(name)
             else:
                 ck_missing.append(name)
-        except EDHRecError:
+        else:
             ck_missing.append(name)
 
         card_prices.append({
@@ -643,6 +660,34 @@ async def price_deck(url: str) -> dict:
             "tcgplayer_price": round(tcg_price, 2) if tcg_price else None,
             "cardkingdom_price": round(ck_price, 2) if ck_price else None,
         })
+
+    # Fallback: for cards Scryfall didn't resolve in the batch (or returned
+    # without USD pricing), retry per-card via get_card_price which searches
+    # alternate printings. This is the same logic the old serial path used,
+    # just narrowed to the cards that need it.
+    if needs_tcg_fallback:
+        fallback_results = await asyncio.gather(
+            *(scryfall.get_card_price(n) for n in needs_tcg_fallback),
+            return_exceptions=True,
+        )
+        qty_by_name = {c["name"]: c.get("quantity", 1) for c in all_cards}
+        for name, fb in zip(needs_tcg_fallback, fallback_results):
+            if isinstance(fb, Exception):
+                tcg_missing.append(name)
+                continue
+            usd = (fb.get("prices") or {}).get("usd")
+            if usd:
+                qty = qty_by_name[name]
+                tcg_price = float(usd) * qty
+                tcg_total += tcg_price
+                tcg_available += qty
+                # Patch the per-card breakdown with the fallback price
+                for entry in card_prices:
+                    if entry["name"] == name:
+                        entry["tcgplayer_price"] = round(tcg_price, 2)
+                        break
+            else:
+                tcg_missing.append(name)
 
     total_cards = sum(c.get("quantity", 1) for c in all_cards)
 

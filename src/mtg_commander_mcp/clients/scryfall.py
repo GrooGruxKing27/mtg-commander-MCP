@@ -163,6 +163,59 @@ class ScryfallClient:
             for r in data.get("data", [])
         ]
 
+    async def get_collection(self, names: list[str]) -> dict[str, dict]:
+        """Batch-look up cards by name via /cards/collection.
+
+        Returns a dict mapping the input name to the card's full Scryfall data
+        (including a "prices" subdict). Names that Scryfall couldn't resolve
+        are absent from the result. Up to 75 names per HTTP request, so a
+        100-card deck costs 2 round-trips instead of 100 fuzzy lookups.
+        """
+        if not names:
+            return {}
+
+        client = self._get_client()
+        result: dict[str, dict] = {}
+        # Lowercase->original lookup so we can map Scryfall's canonicalized
+        # response name back to whatever case the caller passed in.
+        name_lookup = {n.lower(): n for n in names}
+
+        for batch_start in range(0, len(names), 75):
+            batch = names[batch_start : batch_start + 75]
+            identifiers = [{"name": n} for n in batch]
+
+            # Same per-request throttle as the GET path
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_request
+            if elapsed < self.REQUEST_DELAY:
+                await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+
+            try:
+                resp = await client.post(
+                    "/cards/collection", json={"identifiers": identifiers}
+                )
+                self._last_request = asyncio.get_event_loop().time()
+                resp.raise_for_status()
+                data = resp.json()
+            except httpx.HTTPStatusError as e:
+                raise ScryfallError(
+                    f"Scryfall collection error: {e.response.status_code}"
+                ) from e
+            except httpx.TimeoutException as e:
+                raise ScryfallError("Scryfall collection request timed out") from e
+
+            for card in data.get("data", []):
+                # Match by lowercase name OR front-face name for DFCs
+                returned = card.get("name", "")
+                key = name_lookup.get(returned.lower())
+                if key is None:
+                    front = returned.split(" // ")[0]
+                    key = name_lookup.get(front.lower())
+                if key is not None:
+                    result[key] = card
+
+        return result
+
     async def get_card_price(self, name: str) -> dict:
         """Get pricing info for a card, finding a printing with prices if the default lacks them."""
         data = await self._fetch("/cards/named", params={"fuzzy": name})
