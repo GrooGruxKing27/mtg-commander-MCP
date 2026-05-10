@@ -1503,6 +1503,7 @@ async def pull_and_buy_lists(
     archidekt_username: str | None = None,
     include_basics: bool = False,
     cheapest_printing: bool = False,
+    include_over_commit_warnings: bool = False,
 ) -> dict:
     """Cross-reference your collection × existing decks × a new deck,
     printing-aware on both inventory and deck slots.
@@ -1518,19 +1519,36 @@ async def pull_and_buy_lists(
         and a tier indicating how it matched the deck slot
         (``exact`` / ``set`` / ``name``). Constrained by the free pool
         (copies not already committed to other decks).
+      - `pull_list_total_count`: sum of `quantity` across the pull list
+        — total physical cards to fetch.
+      - `pull_list_set_density`: [{set_code, count, cards: [{name,
+        collector_number}]}] sorted by descending count. A physical
+        shopping path through your collection: hit the densest sets
+        first to minimize binder/box traversal.
       - `buy_list`: [{name, set_code, set_name, collector_number,
         scryfall_id, finish, quantity, unit_price_usd, line_total_usd}]
         — cards the new deck needs that aren't in the free pool, with
         TCGPlayer USD pricing.
+      - `buy_list_total_count`: sum of `quantity` across the buy list.
+      - `buy_list_set_density`: same shape as `pull_list_set_density`
+        but for the buy list — useful if you batch TCGPlayer orders
+        by seller (sellers concentrate by set).
       - `buy_list_total_usd`: sum of `line_total_usd` across the buy
         list.
       - `buy_list_missing_prices`: names where no priced English paper
         printing was found.
       - `buy_list_source_breakdown`: `{mtgjson, scryfall, missing}`
         counts showing which backend priced each card.
-      - `over_commit_warnings`: [{name, requested, owned,
-        committed_other_decks}] — name-level signal that the new deck
-        wants a card you've already over-allocated.
+      - `over_commit_warnings_count`: integer count of cards that
+        appear in more existing decks than you own copies of. Always
+        present.
+      - `over_commit_warnings`: full list of `[{name, requested,
+        owned, committed_other_decks}]` — only present when
+        ``include_over_commit_warnings=True``. Suppressed by default
+        because a 60+ deck portfolio routinely shows 40-60 entries,
+        which is informational noise rather than actionable for a
+        specific new-deck build. For dedicated allocation analysis
+        use ``compute_card_allocation`` directly.
       - `decks_considered`: [{name, url}] — existing decks that
         actually contributed (the new deck's own URL is excluded if
         Archidekt auto-discovery surfaced it).
@@ -1559,6 +1577,10 @@ async def pull_and_buy_lists(
         archidekt_username: optional, auto-include user's Commander decks
         include_basics: include basic lands in the buy list (default False)
         cheapest_printing: opt into cheapest-printing search (default False)
+        include_over_commit_warnings: surface the full over-commit
+            warnings list inline. Default False — only the
+            ``over_commit_warnings_count`` is reported so the caller
+            knows whether any exist without paying for the noise.
     """
     rows, err = _load_active()
     if err:
@@ -1627,19 +1649,87 @@ async def pull_and_buy_lists(
         allocation["buy_list"], cheapest_printing=cheapest_printing
     )
 
-    return {
+    response: dict = {
         "new_deck": new_deck_meta,
         "decks_considered": [
             {"name": d.get("name"), "url": d.get("__url")} for d in existing_decks
         ],
         "deck_errors": deck_errors,
         "pull_list": allocation["pull_list"],
+        "pull_list_total_count": sum(
+            int(c.get("quantity", 1)) for c in allocation["pull_list"]
+        ),
+        "pull_list_set_density": _set_density(allocation["pull_list"]),
         "buy_list": pricing["items"],
+        "buy_list_total_count": sum(int(c.get("quantity", 1)) for c in pricing["items"]),
+        "buy_list_set_density": _set_density(pricing["items"]),
         "buy_list_total_usd": pricing["total_usd"],
         "buy_list_missing_prices": pricing["missing"],
         "buy_list_source_breakdown": pricing.get("source_breakdown"),
-        "over_commit_warnings": allocation["over_commit_warnings"],
+        # Always surface the count so the caller knows whether any
+        # warnings exist; the full list is opt-in to avoid drowning
+        # a typical 60+ deck portfolio's response in informational
+        # entries that don't affect the current pull/buy decision.
+        "over_commit_warnings_count": len(allocation["over_commit_warnings"]),
     }
+    if include_over_commit_warnings:
+        response["over_commit_warnings"] = allocation["over_commit_warnings"]
+    return response
+
+
+def _set_density(cards: list[dict]) -> list[dict]:
+    """Bucket a card list by set_code for a "physical shopping path".
+
+    Returns ``[{set_code, count, cards: [{name, collector_number}]}, ...]``
+    sorted by descending count (tie-break ascending set_code so the same
+    inputs always produce the same output — useful for snapshot tests).
+    Cards within each bucket are sorted by leading-integer of
+    collector_number, so a binder ordered by number gets traversed
+    in-order: 17, 50, 99, 110, 155... beats 99, 17, 155, 110, 50.
+
+    Cards without a ``set_code`` land in an ``"unknown"`` bucket so they
+    aren't dropped silently — surfaces parser issues if it happens.
+    Quantity is preserved in the underlying ``pull_list``/``buy_list``
+    entries; this view just groups for shopping.
+    """
+    if not cards:
+        return []
+
+    buckets: dict[str, list[dict]] = {}
+    for c in cards:
+        set_code = c.get("set_code") or "unknown"
+        buckets.setdefault(set_code, []).append(
+            {
+                "name": c.get("name"),
+                "collector_number": c.get("collector_number"),
+            }
+        )
+
+    def _cn_sort_key(card: dict) -> tuple[int, str]:
+        # Extract leading integer prefix from collector_number for the
+        # primary sort key; fall back to the raw string as tiebreaker.
+        # Handles "37", "317a", "★1", "T1", etc. — unparseable prefixes
+        # sort to the end of the set.
+        cn = card.get("collector_number") or ""
+        digits = ""
+        for ch in cn:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        return (int(digits) if digits else 10**9, cn)
+
+    return sorted(
+        (
+            {
+                "set_code": set_code,
+                "count": len(cards_in_set),
+                "cards": sorted(cards_in_set, key=_cn_sort_key),
+            }
+            for set_code, cards_in_set in buckets.items()
+        ),
+        key=lambda b: (-b["count"], b["set_code"]),
+    )
 
 
 # ---------------------------------------------------------------------------
