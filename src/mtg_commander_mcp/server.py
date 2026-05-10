@@ -1129,8 +1129,8 @@ async def compute_card_allocation(
     free, over = col_lib.free_pool(owned, committed)
 
     return {
-        "committed": committed,
-        "free": free,
+        "committed": _serialize_printing_inv(committed),
+        "free": _serialize_printing_inv(free, include_zero=False),
         "over_committed": over,
         "decks_loaded": [
             {
@@ -1144,46 +1144,69 @@ async def compute_card_allocation(
     }
 
 
-async def _price_buy_list(buy_list: list[dict]) -> dict:
-    """Price a list of {name, quantity} cards via Scryfall (TCGPlayer).
+def _serialize_printing_inv(
+    inv: dict, *, include_zero: bool = True
+) -> list[dict]:
+    """Flatten a ``dict[(name, set, cn), {quantity, scryfall_id}]`` to
+    a sorted list of JSON-safe rows. Tuple keys aren't JSON-serializable,
+    so the tools that surface these inventories convert here.
+    """
+    rows: list[dict] = []
+    for key, info in inv.items():
+        qty = int(info.get("quantity", 0))
+        if not include_zero and qty <= 0:
+            continue
+        rows.append(
+            {
+                "name": key[0],
+                "set_code": key[1],
+                "collector_number": key[2],
+                "quantity": qty,
+                "scryfall_id": info.get("scryfall_id"),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            r["name"],
+            r.get("set_code") or "",
+            r.get("collector_number") or "",
+        )
+    )
+    return rows
 
-    Mirrors price_deck's resolve-then-fallback pattern at server.py:670
-    but only fetches TCGPlayer USD — no Card Kingdom / EDHRec round-
-    trips. Card Kingdom pricing for the buy list is a future
-    enhancement.
+
+async def _price_buy_list(buy_list: list[dict]) -> dict:
+    """Price a buy list using the cheapest English-paper printing per card.
+
+    Each input entry has ``{name, quantity, [set_code,
+    collector_number, scryfall_id]}`` — the optional fields describe
+    what the deck originally requested. The priced output row OVERRIDES
+    those with the cheapest printing's info so the user can buy the
+    cheap copy, not whatever variant the deck list happened to call
+    for.
+
+    Latency-wise this is one Scryfall ``/cards/search`` per unique
+    name with a 4-way semaphore + 100ms global throttle — call it
+    ~250ms per name, with 429 backoff adding noise. A 100-card buy
+    list completes in ~30s on a cold cache.
     """
     if not buy_list:
         return {"items": [], "total_usd": 0.0, "missing": []}
 
-    names = list({c["name"] for c in buy_list})
-    try:
-        scryfall_data, not_found = await scryfall.get_collection(names)
-    except ScryfallError as e:
-        return {"items": [], "total_usd": 0.0, "missing": names, "error": str(e)}
+    unique_names = list({c["name"] for c in buy_list})
 
-    needs_fallback: list[str] = list(not_found)
-    fallback_set = set(needs_fallback)
-    for name in names:
-        sd = scryfall_data.get(name)
-        if sd is None or not (sd.get("prices") or {}).get("usd"):
-            if name not in fallback_set:
-                needs_fallback.append(name)
-                fallback_set.add(name)
-
-    if needs_fallback:
-        sem = asyncio.Semaphore(4)
-
-        async def _one(n: str):
-            async with sem:
-                try:
-                    return n, await scryfall.get_card_price(n)
-                except ScryfallError as e:
-                    return n, e
-
-        for name, fb in await asyncio.gather(*(_one(n) for n in needs_fallback)):
-            if isinstance(fb, ScryfallError):
-                continue
-            scryfall_data[name] = fb
+    # Serial lookup. The Scryfall client's global 100ms throttle already
+    # forces serialization between requests; concurrent fan-out just
+    # piles up 429s without buying any wall-clock — empirically ~48% of
+    # cards lost prices with a semaphore of 4. Serial @ ~250ms/card
+    # handles a 100-card buy list in ~25s, well under the MCP timeout.
+    cheapest_by_name: dict[str, dict | None] = {}
+    for name in unique_names:
+        try:
+            cheapest_by_name[name] = await scryfall.get_cheapest_printing(name)
+        except ScryfallError as e:
+            logger.warning("Cheapest-printing lookup failed for %r: %s", name, e)
+            cheapest_by_name[name] = None
 
     total = 0.0
     items: list[dict] = []
@@ -1191,16 +1214,20 @@ async def _price_buy_list(buy_list: list[dict]) -> dict:
     for entry in buy_list:
         name = entry["name"]
         qty = int(entry["quantity"])
-        sd = scryfall_data.get(name) or {}
-        usd = (sd.get("prices") or {}).get("usd")
-        if usd:
-            unit = float(usd)
+        cheapest = cheapest_by_name.get(name)
+        if cheapest:
+            unit = float(cheapest["usd"])
             line = round(unit * qty, 2)
             total += line
             items.append(
                 {
                     "name": name,
                     "quantity": qty,
+                    "set_code": cheapest["set_code"],
+                    "set_name": cheapest.get("set_name"),
+                    "collector_number": cheapest["collector_number"],
+                    "scryfall_id": cheapest["scryfall_id"],
+                    "finish": cheapest.get("finish"),
                     "unit_price_usd": round(unit, 2),
                     "line_total_usd": line,
                 }
@@ -1211,6 +1238,9 @@ async def _price_buy_list(buy_list: list[dict]) -> dict:
                 {
                     "name": name,
                     "quantity": qty,
+                    "set_code": entry.get("set_code"),
+                    "collector_number": entry.get("collector_number"),
+                    "scryfall_id": entry.get("scryfall_id"),
                     "unit_price_usd": None,
                     "line_total_usd": None,
                 }
@@ -1261,8 +1291,9 @@ async def pull_and_buy_lists(
     if err:
         return {"error": err}
 
-    # Resolve "new deck" — URL or pasted decklist.
-    new_deck_cards: dict[str, int]
+    # Resolve "new deck" — URL or pasted decklist. The result is a
+    # printing-keyed dict ``{(name, set, cn): {quantity, scryfall_id}}``;
+    # see collection.py for the allocator's matching tiers.
     new_deck_meta: dict
     if new_deck.startswith(("http://", "https://")):
         try:
@@ -1286,7 +1317,10 @@ async def pull_and_buy_lists(
                     "(expected lines like '1 Sol Ring')"
                 )
             }
-        new_deck_meta = {"source": "text", "card_count": sum(new_deck_cards.values())}
+        new_deck_meta = {
+            "source": "text",
+            "card_count": sum(int(v.get("quantity", 0)) for v in new_deck_cards.values()),
+        }
 
     owned = col_lib.aggregate_owned(rows)
     existing_decks, deck_errors = await _gather_decks(deck_urls, archidekt_username)

@@ -82,12 +82,16 @@ class MoxfieldClient:
             for card_name, entry in board_data.items():
                 quantity = entry.get("quantity", 1)
                 card_obj = entry.get("card", {})
+                set_code = card_obj.get("set")
                 cards.append({
                     "name": card_obj.get("name", card_name),
                     "quantity": quantity,
                     "cmc": card_obj.get("cmc"),
                     "type_line": card_obj.get("type_line"),
                     "color_identity": card_obj.get("color_identity"),
+                    "set_code": set_code.lower() if set_code else None,
+                    "collector_number": card_obj.get("cn"),
+                    "scryfall_id": card_obj.get("scryfall_id"),
                 })
                 total_cards += quantity
             if cards:

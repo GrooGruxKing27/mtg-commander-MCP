@@ -25,7 +25,12 @@ class ScryfallClient:
 
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
-        self._cache = Cache(ttl=300)
+        # 30-minute TTL. Pricing data shifts on roughly a daily cadence
+        # (TCGPlayer market checks every few hours), and the cheapest-
+        # printing scan now issues one search per unique buy-list card —
+        # without aggressive caching, a fresh pull/buy run takes
+        # 2+ minutes. 30min keeps repeat calls within a session free.
+        self._cache = Cache(ttl=1800)
         self._last_request = 0.0
         # Serializes the "check elapsed → sleep → mark sent" critical section
         # so concurrent coroutines can't all observe stale `_last_request` and
@@ -58,15 +63,29 @@ class ScryfallClient:
 
         client = self._get_client()
 
-        for attempt in range(3):
+        # 5 attempts with exponential backoff that honors any
+        # ``Retry-After`` header Scryfall returns. The bigger budget
+        # matters when a long serial scan (cheapest-printing across a
+        # 50+ card buy list) hits a transient 429 burst — 3 attempts
+        # @ 1/2/3s often timed out for ~20% of cards.
+        for attempt in range(5):
             await self._throttle()
 
             try:
                 resp = await client.get(path, params=params)
 
-                # Retry on rate limit
                 if resp.status_code == 429:
-                    await asyncio.sleep(1.0 + attempt)
+                    retry_after_hdr = resp.headers.get("Retry-After")
+                    try:
+                        retry_after = float(retry_after_hdr) if retry_after_hdr else None
+                    except ValueError:
+                        retry_after = None
+                    wait = retry_after if retry_after else (1.0 + attempt * 2)
+                    logger.info(
+                        "Scryfall 429 on %s (attempt %d); waiting %.1fs",
+                        path, attempt + 1, wait,
+                    )
+                    await asyncio.sleep(wait)
                     continue
 
                 resp.raise_for_status()
@@ -266,6 +285,69 @@ class ScryfallClient:
 
         self._cache.set(cache_key, (result, not_found))
         return result, not_found
+
+    async def get_cheapest_printing(self, name: str) -> dict | None:
+        """Return the cheapest English paper printing of `name`.
+
+        Considers both non-foil and foil prices (precon commanders are
+        often cheaper as foil than the nonfoil variant). Filters:
+          * ``lang:en`` — English only
+          * ``game:paper`` — exclude MTGO/Arena-only printings
+          * ``-is:oversized`` — exclude commander oversized cards
+          * ``-is:artseries`` — exclude art-series cards
+          * has at least one of usd/usd_foil > 0
+
+        For each candidate, picks the smaller of ``prices.usd`` and
+        ``prices.usd_foil`` and reports it (with which finish won) so
+        the buy list points the user at the actually-cheapest variant,
+        not just the nonfoil. Returns None if no qualifying printing
+        exists.
+        """
+        query = (
+            f'!"{name}" lang:en game:paper '
+            f"(usd>0 or usd_foil>0) "
+            f"-is:oversized -is:artseries"
+        )
+        try:
+            data = await self._fetch(
+                "/cards/search",
+                params={"q": query, "unique": "prints"},
+            )
+        except ScryfallError:
+            return None
+
+        best: tuple[float, str, dict] | None = None
+        for card in data.get("data", []):
+            prices = card.get("prices") or {}
+            candidates: list[tuple[float, str]] = []
+            for field, finish in (("usd", "nonfoil"), ("usd_foil", "foil")):
+                val = prices.get(field)
+                if not val:
+                    continue
+                try:
+                    candidates.append((float(val), finish))
+                except (TypeError, ValueError):
+                    continue
+            if not candidates:
+                continue
+            price, finish = min(candidates)
+            if best is None or price < best[0]:
+                best = (price, finish, card)
+
+        if best is None:
+            return None
+        price, finish, card = best
+        return {
+            "name": card.get("name"),
+            "set_code": (card.get("set") or "").lower() or None,
+            "set_name": card.get("set_name"),
+            "collector_number": card.get("collector_number"),
+            "scryfall_id": card.get("id"),
+            "usd": price,
+            "finish": finish,
+            "scryfall_uri": card.get("scryfall_uri"),
+            "purchase_uris": card.get("purchase_uris"),
+        }
 
     async def get_card_price(self, name: str) -> dict:
         """Get pricing info for a card, finding a printing with prices if the default lacks them."""

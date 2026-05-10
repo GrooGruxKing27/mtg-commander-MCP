@@ -196,6 +196,7 @@ class ArchidektClient:
             card_categories = entry.get("categories") or ["Uncategorized"]
             quantity = entry.get("quantity", 1)
 
+            edition_code = (card_data.get("edition") or {}).get("editioncode")
             card = {
                 "name": oracle.get("name") or card_data.get("displayName") or "Unknown",
                 "quantity": quantity,
@@ -203,7 +204,10 @@ class ArchidektClient:
                 "colors": oracle.get("colors") or card_data.get("colors"),
                 "color_identity": oracle.get("colorIdentity") or card_data.get("colorIdentity"),
                 "type_line": oracle.get("typeLine"),
-                "edition": (card_data.get("edition") or {}).get("editioncode"),
+                "edition": edition_code,
+                "set_code": edition_code.lower() if edition_code else None,
+                "collector_number": card_data.get("collectorNumber"),
+                "scryfall_id": card_data.get("uid"),
             }
 
             for cat in card_categories:
