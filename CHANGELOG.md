@@ -5,6 +5,61 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-10 — Per-marketplace buy-list view as primary
+
+### Added
+- **`buy_list_by_marketplace`** is now populated whenever the MTGJSON
+  cache is fresh (previously: only when `cheapest_printing=True`).
+  Shape is **dict keyed by marketplace name** —
+  `{tcgplayer: {total_usd, cards_priced, cards_unavailable,
+  cards_unavailable_count}, cardkingdom: {...}, manapool: {...}}`.
+  Each entry's `total_usd` is what the whole buy list would cost from
+  that single shop alone (using the shop's own cheapest English-paper
+  printing); `cards_unavailable` lists what the shop doesn't carry.
+  Lets the user pick a single-seller order with a clear "missing N
+  cards" caveat. **This is the primary buy-decision view.**
+- **`buy_list_optimal_split`** — new field. Per-card cheapest USD
+  marketplace selection across TCGplayer / Card Kingdom / Manapool,
+  with `savings_vs_cheapest_single_marketplace` so the caller sees
+  the cross-shop savings vs. the cheapest single-shop total. Carries
+  `marketplaces_used`, `marketplace_card_counts`, and the per-card
+  breakdown. Floor on what the buy list *could* cost, with an explicit
+  docstring caveat that per-card optimization ignores shipping cost
+  and seller fragmentation.
+
+### Changed
+- **`buy_list_by_marketplace` shape is breaking-changed from v0.5.0.**
+  v0.5.0 returned a list `[{marketplace, subtotal_usd, item_count,
+  items}]` only in cheapest-printing mode, grouping cards by their
+  winning shop. v0.6.0 returns a dict keyed by marketplace where each
+  entry covers the *whole* buy list (not just the cards that won at
+  that shop). The cards-by-winning-shop view moved to
+  `buy_list_optimal_split.marketplace_card_counts` +
+  `buy_list_optimal_split.cards` (each carrying a `marketplace`).
+- **`pull_and_buy_lists` docstring** now leads with the
+  per-marketplace view, demotes `buy_list_set_density` to "useful for
+  binder/box traversal when picking from a single-seller bundle, less
+  useful for deciding *which seller* to order from."
+- **`_price_buy_list_cheapest`** rebuilt around the shared
+  `_build_marketplace_views` helper so per-card and per-marketplace
+  logic isn't duplicated across the fast/cheapest pricing paths.
+
+### Notes
+- Cardmarket (EUR) and Cardhoarder (MTGO digital tix) are still
+  intentionally omitted — mixing currencies/formats in a single
+  USD-paper buy-list optimization is misleading. Raw multi-currency
+  prices remain queryable via `MTGJSONClient.lookup_price`.
+- Per-marketplace data is MTGJSON-only — no Scryfall fallback (the
+  Scryfall API only exposes its TCGplayer affiliate price). When the
+  cache is cold/stale, the new fields are `null` and a background
+  refresh is kicked off; the existing buy-list pricing falls through
+  to Scryfall as before.
+- Empirical motivation: on a 48-card buy list with 25 distinct sets,
+  set-density grouping had a top bucket of 6 cards (and a long tail of
+  14 sets at 1 card each) — i.e., the "grouping" wasn't actionably
+  grouping anything for a buy decision. Per-marketplace totals are
+  decision-grade ("CK is $24 cheaper than TCG but missing 1 card").
+
 ## [0.4.1] — 2026-05-10 — UX polish on `pull_and_buy_lists`
 
 ### Added
