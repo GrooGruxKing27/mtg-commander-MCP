@@ -1,3 +1,4 @@
+import asyncio
 import re
 import time
 from typing import Any
@@ -15,6 +16,37 @@ def to_slug(name: str) -> str:
     slug = re.sub(r"['\",:.!?&]", "", slug)
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     return slug.strip("-")
+
+
+# Background-close tasks for discarded httpx clients, held here so they
+# aren't garbage-collected mid-close; entries remove themselves on completion.
+_pending_closes: set = set()
+
+
+def discard_async_client(client: Any) -> None:
+    """Close an httpx.AsyncClient without awaiting it.
+
+    Used when a client's connection pool may be wedged (request cancelled
+    mid-flight by the MCP host, repeated timeouts, transport errors). The
+    owner detaches its reference first so the next request builds a fresh
+    pool; the old client is then closed in a background task where a hung
+    close can't block anything — and where cancellation of the *caller*
+    can't interrupt the close halfway.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no running loop (interpreter teardown) — let GC handle it
+    task = loop.create_task(_aclose_quietly(client))
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
+
+
+async def _aclose_quietly(client: Any) -> None:
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=5.0)
+    except Exception:
+        pass
 
 
 class Cache:

@@ -5,6 +5,46 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-31 — Fix scryfall_search wedging until restart
+
+### Added
+- `tests/` — pytest suite (25 tests, `uv run --no-editable pytest`)
+  covering the retry/reset/deadline behavior below via
+  `httpx.MockTransport`; `pytest` + `pytest-asyncio` added as a dev
+  dependency group.
+
+### Fixed
+- **`scryfall_search` (and other Scryfall tools) could hang indefinitely
+  mid-session until the server was restarted.** Root cause: each client
+  keeps one long-lived `httpx.AsyncClient`; a request cancelled mid-flight
+  (the MCP host giving up on a slow call) or killed at the transport layer
+  could leave that client's connection pool wedged, and nothing ever
+  recovered it — every later Scryfall call then hung silently. The
+  Scryfall and EDHRec clients now discard and background-close their
+  HTTP client on cancellation, timeouts, and transport errors, so the
+  next call builds a fresh pool and self-heals (Archidekt gets the same
+  treatment for timeout/transport errors).
+- **Silent multi-minute hangs replaced with fast, explicit errors.**
+  Every logical Scryfall call now runs under a hard 45s deadline
+  (retries included) and returns `{"error": ...}` when exceeded,
+  instead of hanging until the MCP host's ~4-minute timeout.
+- **Unbounded 429 back-off.** `Retry-After` from Scryfall/Cloudflare is
+  now capped at 10s per wait; previously a large header value slept the
+  tool call for arbitrarily long.
+- **`/cards/collection` batches** now go through the same throttled,
+  429-retrying, deadline-bounded request path as GETs (previously: no
+  retries, no deadline).
+- **EDHRec JSON-level redirects** are capped at 5 hops (two pages
+  redirecting to each other previously recursed without bound), and a
+  redirected page's result is now also cached under the original path.
+- **Moxfield fetches had no HTTP timeout** — a stalled Cloudflare
+  handshake could hang `import_deck` forever. Now 30s.
+
+### Changed
+- Scryfall/EDHRec pools capped (10 connections, 5 keep-alive) with a 30s
+  keep-alive expiry so idle connections aren't reused after Cloudflare
+  drops them server-side (previously a 15s stall per stale connection).
+
 ## [0.6.0] — 2026-05-10 — Per-marketplace buy-list view as primary
 
 ### Added

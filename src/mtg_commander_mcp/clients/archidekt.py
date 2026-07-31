@@ -3,7 +3,7 @@ import re
 import httpx
 
 from mtg_commander_mcp import __version__
-from mtg_commander_mcp.utils import Cache
+from mtg_commander_mcp.utils import Cache, discard_async_client
 
 
 class ArchidektError(Exception):
@@ -27,6 +27,13 @@ class ArchidektClient:
                 },
             )
         return self._client
+
+    def _reset_client(self) -> None:
+        """Discard the shared client so the next request builds a fresh pool
+        (a request killed at the transport layer can leave the pool wedged)."""
+        client, self._client = self._client, None
+        if client is not None:
+            discard_async_client(client)
 
     @staticmethod
     def extract_deck_id(url: str) -> str:
@@ -57,7 +64,13 @@ class ArchidektClient:
                 raise ArchidektError(f"Deck not found: {deck_id}") from e
             raise ArchidektError(f"Archidekt error: {e.response.status_code}") from e
         except httpx.TimeoutException as e:
+            self._reset_client()
             raise ArchidektError("Archidekt request timed out") from e
+        except httpx.TransportError as e:
+            self._reset_client()
+            raise ArchidektError(
+                f"Archidekt connection error: {type(e).__name__}"
+            ) from e
 
         result = self._parse_deck(data)
         self._cache.set(cache_key, result)
@@ -146,7 +159,13 @@ class ArchidektClient:
                     f"Archidekt user-decks error: {e.response.status_code}"
                 ) from e
             except httpx.TimeoutException as e:
+                self._reset_client()
                 raise ArchidektError("Archidekt request timed out") from e
+            except httpx.TransportError as e:
+                self._reset_client()
+                raise ArchidektError(
+                    f"Archidekt connection error: {type(e).__name__}"
+                ) from e
 
             entries = data.get("results") if isinstance(data, dict) else None
             if not entries:

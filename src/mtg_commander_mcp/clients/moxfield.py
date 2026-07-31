@@ -61,7 +61,9 @@ class MoxfieldClient:
     def _fetch_sync(self, deck_id: str) -> dict:
         # Per-call scraper — see __init__ comment.
         scraper = cloudscraper.create_scraper()
-        resp = scraper.get(f"{self.API_URL}/{deck_id}")
+        # Explicit timeout: requests defaults to none, and a stalled
+        # Cloudflare handshake would otherwise hang the tool call forever.
+        resp = scraper.get(f"{self.API_URL}/{deck_id}", timeout=30)
         if resp.status_code == 404:
             raise MoxfieldError(f"Deck not found: {deck_id}")
         if resp.status_code != 200:

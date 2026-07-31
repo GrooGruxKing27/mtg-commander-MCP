@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 
 from mtg_commander_mcp import __version__
-from mtg_commander_mcp.utils import Cache
+from mtg_commander_mcp.utils import Cache, discard_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,19 @@ class ScryfallClient:
     }
     # Scryfall asks for 50-100ms between requests
     REQUEST_DELAY = 0.1
+    # Hard ceiling on one logical API call, retries included. Well under any
+    # MCP host timeout, so a wedged request surfaces as an explicit error the
+    # caller can react to instead of a silent multi-minute hang.
+    TOTAL_DEADLINE = 45.0
+    # A 429's Retry-After is honored but capped: Cloudflare occasionally sends
+    # multi-minute values, and sleeping that long inside a tool call is
+    # indistinguishable from a hang to the caller.
+    MAX_RETRY_WAIT = 10.0
+    # 5 attempts with backoff that honors (capped) ``Retry-After``. The bigger
+    # budget matters when a long serial scan (cheapest-printing across a 50+
+    # card buy list) hits a transient 429 burst — 3 attempts often failed for
+    # ~20% of cards.
+    MAX_ATTEMPTS = 5
 
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
@@ -44,8 +58,48 @@ class ScryfallClient:
                 base_url=self.BASE_URL,
                 headers=self.HEADERS,
                 timeout=15.0,
+                # Cap the pool and expire idle keep-alives quickly: Scryfall
+                # sits behind Cloudflare, which drops idle connections
+                # server-side; reusing a half-closed one costs a 15s stall.
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=30.0,
+                ),
             )
         return self._client
+
+    def _reset_client(self) -> None:
+        """Discard the shared client so the next request builds a fresh pool.
+
+        A request cancelled mid-flight (MCP host giving up on a slow call) or
+        killed at the transport layer can leave httpx's connection pool in a
+        wedged state. Before this existed, that state persisted for the life
+        of the process: every later Scryfall call hung silently until the MCP
+        server was restarted.
+        """
+        client, self._client = self._client, None
+        if client is not None:
+            logger.warning("Resetting Scryfall HTTP client (pool may be wedged)")
+            discard_async_client(client)
+
+    @asynccontextmanager
+    async def _deadline(self):
+        """Bound a logical call to TOTAL_DEADLINE and self-heal on failure."""
+        try:
+            async with asyncio.timeout(self.TOTAL_DEADLINE):
+                yield
+        except TimeoutError as e:
+            self._reset_client()
+            raise ScryfallError(
+                f"Scryfall did not answer within {self.TOTAL_DEADLINE:.0f}s; "
+                "the connection was reset — retry the call"
+            ) from e
+        except asyncio.CancelledError:
+            # The host gave up on us and is tearing the request down
+            # mid-transfer; don't trust the pool afterwards.
+            self._reset_client()
+            raise
 
     async def _throttle(self) -> None:
         """Enforce REQUEST_DELAY between Scryfall hits across all coroutines."""
@@ -55,24 +109,29 @@ class ScryfallClient:
                 await asyncio.sleep(self.REQUEST_DELAY - elapsed)
             self._last_request = time.monotonic()
 
-    async def _fetch(self, path: str, params: dict | None = None) -> dict:
-        cache_key = f"{path}:{params}"
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json_body: dict | None = None,
+    ) -> dict:
+        """One Scryfall call with throttling, bounded 429 retries, and
+        transport-level failures converted to ``ScryfallError``.
 
-        client = self._get_client()
-
-        # 5 attempts with exponential backoff that honors any
-        # ``Retry-After`` header Scryfall returns. The bigger budget
-        # matters when a long serial scan (cheapest-printing across a
-        # 50+ card buy list) hits a transient 429 burst — 3 attempts
-        # @ 1/2/3s often timed out for ~20% of cards.
-        for attempt in range(5):
+        Callers must wrap this in ``self._deadline()`` so the retry loop
+        can't outlive the per-call budget.
+        """
+        for attempt in range(self.MAX_ATTEMPTS):
             await self._throttle()
+            # Re-resolved each attempt: an error handler may have reset it.
+            client = self._get_client()
 
             try:
-                resp = await client.get(path, params=params)
+                resp = await client.request(
+                    method, path, params=params, json=json_body
+                )
 
                 if resp.status_code == 429:
                     retry_after_hdr = resp.headers.get("Retry-After")
@@ -80,7 +139,10 @@ class ScryfallClient:
                         retry_after = float(retry_after_hdr) if retry_after_hdr else None
                     except ValueError:
                         retry_after = None
-                    wait = retry_after if retry_after else (1.0 + attempt * 2)
+                    wait = min(
+                        retry_after if retry_after else (1.0 + attempt * 2),
+                        self.MAX_RETRY_WAIT,
+                    )
                     logger.info(
                         "Scryfall 429 on %s (attempt %d); waiting %.1fs",
                         path, attempt + 1, wait,
@@ -89,19 +151,37 @@ class ScryfallClient:
                     continue
 
                 resp.raise_for_status()
-                data = resp.json()
+                return resp.json()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
-                    detail = e.response.json().get("details", "Not found")
+                    try:
+                        detail = e.response.json().get("details", "Not found")
+                    except ValueError:
+                        detail = "Not found"
                     raise ScryfallError(detail) from e
                 raise ScryfallError(f"Scryfall API error: {e.response.status_code}") from e
             except httpx.TimeoutException as e:
+                self._reset_client()
                 raise ScryfallError("Scryfall request timed out") from e
-
-            self._cache.set(cache_key, data)
-            return data
+            except httpx.TransportError as e:
+                self._reset_client()
+                raise ScryfallError(
+                    f"Scryfall connection error: {type(e).__name__}"
+                ) from e
 
         raise ScryfallError("Scryfall rate limit exceeded after retries")
+
+    async def _fetch(self, path: str, params: dict | None = None) -> dict:
+        cache_key = f"{path}:{params}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        async with self._deadline():
+            data = await self._request_json("GET", path, params=params)
+
+        self._cache.set(cache_key, data)
+        return data
 
     async def get_card(self, name: str) -> dict:
         """Look up a card by name (fuzzy matching)."""
@@ -226,7 +306,6 @@ class ScryfallClient:
         if cached is not None:
             return cached
 
-        client = self._get_client()
         result: dict[str, dict] = {}
         not_found: list[str] = []
         not_found_set: set[str] = set()
@@ -239,20 +318,15 @@ class ScryfallClient:
             batch = names[batch_start : batch_start + 75]
             identifiers = [{"name": n} for n in batch]
 
-            await self._throttle()
-
-            try:
-                resp = await client.post(
-                    "/cards/collection", json={"identifiers": identifiers}
+            # Deadline per batch (not per call): a large collection can
+            # legitimately take many batches, but no single batch should be
+            # able to hang the tool.
+            async with self._deadline():
+                data = await self._request_json(
+                    "POST",
+                    "/cards/collection",
+                    json_body={"identifiers": identifiers},
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPStatusError as e:
-                raise ScryfallError(
-                    f"Scryfall collection error: {e.response.status_code}"
-                ) from e
-            except httpx.TimeoutException as e:
-                raise ScryfallError("Scryfall collection request timed out") from e
 
             matched_in_batch: set[str] = set()
             for card in data.get("data", []):

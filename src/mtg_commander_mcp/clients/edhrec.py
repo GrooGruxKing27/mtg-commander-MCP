@@ -4,7 +4,7 @@ import logging
 import httpx
 
 from mtg_commander_mcp import __version__
-from mtg_commander_mcp.utils import Cache, to_slug
+from mtg_commander_mcp.utils import Cache, discard_async_client, to_slug
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,9 @@ VALID_COLOR_FILTERS = [
 
 class EDHRecClient:
     BASE_URL = "https://json.edhrec.com/pages"
+    # Bound on chained JSON-level redirects; without it two pages that
+    # redirect to each other would recurse until the stack blew.
+    MAX_REDIRECTS = 5
 
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
@@ -35,10 +38,29 @@ class EDHRecClient:
             self._client = httpx.AsyncClient(
                 timeout=15.0,
                 headers={"User-Agent": f"MTGCommanderMCP/{__version__}"},
+                # Expire idle keep-alives before EDHRec's CDN drops them
+                # server-side; reusing a half-closed one costs a 15s stall.
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=30.0,
+                ),
             )
         return self._client
 
-    async def _fetch(self, path: str) -> dict:
+    def _reset_client(self) -> None:
+        """Discard the shared client so the next request builds a fresh pool.
+
+        A request cancelled mid-flight or killed at the transport layer can
+        leave httpx's pool wedged; dropping the client lets the next call
+        self-heal instead of hanging until the server is restarted.
+        """
+        client, self._client = self._client, None
+        if client is not None:
+            logger.warning("Resetting EDHRec HTTP client (pool may be wedged)")
+            discard_async_client(client)
+
+    async def _fetch(self, path: str, _depth: int = 0) -> dict:
         cached = self._cache.get(path)
         if cached is not None:
             return cached
@@ -54,12 +76,24 @@ class EDHRecClient:
                 raise EDHRecError(f"Not found: {path}") from e
             raise EDHRecError(f"EDHRec error: {e.response.status_code}") from e
         except httpx.TimeoutException as e:
+            self._reset_client()
             raise EDHRecError("EDHRec request timed out") from e
+        except httpx.TransportError as e:
+            self._reset_client()
+            raise EDHRecError(f"EDHRec connection error: {type(e).__name__}") from e
+        except asyncio.CancelledError:
+            self._reset_client()
+            raise
 
         # Handle EDHRec JSON-level redirects
         if isinstance(data, dict) and "redirect" in data:
+            if _depth >= self.MAX_REDIRECTS:
+                raise EDHRecError(f"EDHRec redirect loop at: {path}")
             redirect_path = data["redirect"].strip("/")
-            return await self._fetch(redirect_path)
+            data = await self._fetch(redirect_path, _depth + 1)
+            # Cache under the original path too so the next call skips the hop.
+            self._cache.set(path, data)
+            return data
 
         self._cache.set(path, data)
         return data
