@@ -5,6 +5,42 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-07-31 — Tool-level timeout backstop
+
+### Added
+- **`bounded()` decorator** (`server.py`) — a second, independent timeout
+  layer at the tool boundary (55s), applied to every single-purpose
+  lookup tool (`scryfall_search`, `scryfall_card`, `scryfall_rulings`,
+  and the `edhrec_*` tools). Each client already bounds its own network
+  calls (see 0.6.1), but this guarantees no such tool can silently run
+  past the deadline even if a future bug — in our code or a dependency —
+  bypasses a client's internal deadline. A timeout now returns a normal
+  `{"error": "... timed out after 55s — retry the call"}` response.
+  Not applied to multi-step tools (`build_deck`, `price_deck`,
+  `pull_and_buy_lists`, `compute_card_allocation`) — those legitimately
+  need more time and already rely on their clients' own per-call
+  deadlines.
+
+### Investigated
+- A follow-up report claimed `scryfall_search` still hung ~4 minutes on
+  a specific query shape (`t:land o:"add {b}" o:"add {g}" -o:"any
+  color"`) even after the 0.6.1 fix. Could not reproduce: the same
+  query answered in 0.28s hitting Scryfall directly, and in the live
+  MCP tool. No formatting bug found (no `.format()`/f-string calls that
+  interpolate the raw query, so the `{b}`/`{g}` braces aren't at risk of
+  being misread as template placeholders), and every Scryfall client
+  method already routes through the 0.6.1 deadline with no gaps. Most
+  likely a transient network stall rather than a deterministic
+  per-query trigger — the `bounded()` backstop above is the mitigation
+  pending a repeat occurrence with more detail (e.g. correlated with
+  Mac sleep/wake or VPN state).
+
+### Notes
+- `uv run --directory <repo> --no-editable` does not rebuild the
+  installed wheel on source-only edits — only on a `version` bump in
+  `pyproject.toml`. Confirmed again this session: an unbumped edit was
+  silently invisible to a fresh `uv run`.
+
 ## [0.6.1] — 2026-07-31 — Fix scryfall_search wedging until restart
 
 ### Added

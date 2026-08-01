@@ -1,10 +1,42 @@
 import asyncio
+import functools
 import logging
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
+
+# Backstop above every client's own internal network deadline (e.g.
+# ScryfallClient.TOTAL_DEADLINE). Each client already bounds its own HTTP
+# calls, but this is a second, independent layer at the tool boundary: if a
+# future bug in a client — or in a library it depends on — ever creates a
+# hang that bypasses the client's internal deadline, this still turns it
+# into a fast, explicit error instead of a silent hang that lasts until the
+# MCP host's own multi-minute timeout kicks in.
+TOOL_DEADLINE = 55.0
+
+
+def bounded(seconds: float = TOOL_DEADLINE):
+    """Decorator: cap a tool handler's total runtime, converting a timeout
+    into a normal ``{"error": ...}`` tool response instead of a hang.
+
+    Scope this to single-purpose lookup tools (one or two network calls).
+    Multi-step tools (deck building, pricing scans) legitimately need more
+    time and already rely on their clients' own per-call deadlines.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
+            except asyncio.TimeoutError:
+                logger.warning("%s exceeded %.0fs tool deadline", func.__name__, seconds)
+                return {
+                    "error": f"{func.__name__} timed out after {seconds:.0f}s — retry the call"
+                }
+        return wrapper
+    return decorator
 
 from mtg_commander_mcp.clients.edhrec import EDHRecClient, EDHRecError, VALID_COLOR_FILTERS
 from mtg_commander_mcp.clients.scryfall import ScryfallClient, ScryfallError
@@ -33,6 +65,7 @@ mtgjson = MTGJSONClient()
 
 
 @mcp.tool()
+@bounded()
 async def edhrec_commander_recommendations(
     commander_name: str,
     theme: str | None = None,
@@ -59,6 +92,7 @@ async def edhrec_commander_recommendations(
 
 
 @mcp.tool()
+@bounded()
 async def edhrec_commander_combos(
     commander_name: str,
     limit: int = 10,
@@ -80,6 +114,7 @@ async def edhrec_commander_combos(
 
 
 @mcp.tool()
+@bounded()
 async def edhrec_commander_themes(commander_name: str) -> dict:
     """Get available themes/archetypes for a commander from EDHRec.
 
@@ -97,6 +132,7 @@ async def edhrec_commander_themes(commander_name: str) -> dict:
 
 
 @mcp.tool()
+@bounded()
 async def edhrec_top_cards(
     period: Literal["year", "month", "week"] = "year",
     limit: int = 20,
@@ -125,6 +161,7 @@ ColorFilter = Literal[
 
 
 @mcp.tool()
+@bounded()
 async def edhrec_search_commanders(
     color_identity: ColorFilter,
     limit: int = 25,
@@ -151,6 +188,7 @@ async def edhrec_search_commanders(
 
 
 @mcp.tool()
+@bounded()
 async def scryfall_card(card_name: str) -> dict:
     """Look up a card on Scryfall. Returns full card data including oracle text,
     mana cost, type line, legality, Scryfall pricing (usd / eur / tix), and image.
@@ -165,6 +203,7 @@ async def scryfall_card(card_name: str) -> dict:
 
 
 @mcp.tool()
+@bounded()
 async def scryfall_search(query: str, limit: int = 20) -> dict:
     """Search for cards using Scryfall search syntax.
 
@@ -183,6 +222,7 @@ async def scryfall_search(query: str, limit: int = 20) -> dict:
 
 
 @mcp.tool()
+@bounded()
 async def scryfall_rulings(card_name: str) -> dict:
     """Get official rulings for a card from Scryfall.
 

@@ -449,7 +449,7 @@ wheels = [
 
 [[package]]
 name = "mtg-commander-mcp"
-version = "0.6.1"
+version = "0.6.2"
 source = { editable = "." }
 dependencies = [
     { name = "cloudscraper" },
