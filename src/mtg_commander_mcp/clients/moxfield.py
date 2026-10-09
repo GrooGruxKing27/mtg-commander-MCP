@@ -107,5 +107,6 @@ class MoxfieldClient:
             "format": data.get("format"),
             "owner": data.get("createdByUser", {}).get("userName"),
             "categories": categories,
+            "excluded_categories": ["Sideboard", "Companions"],
             "card_count": total_cards,
         }

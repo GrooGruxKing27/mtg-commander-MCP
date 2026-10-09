@@ -12,6 +12,7 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 | **Moxfield** | Deck import from URL (Cloudflare bypass via cloudscraper) |
 | **MTG Comprehensive Rules** | Searchable rules and glossary (auto-downloads latest from Wizards) |
 | **Delver Lens** | Collection import from CSV exports (Delver / Moxfield / TCGPlayer / Deckbox / MTGstand presets) |
+| **Commander Spellbook** | Combo search (cards, results, steps, bracket tags) and in-deck combo detection |
 | **MTGJSON** | Daily bulk pricing snapshot — TCGplayer + Card Kingdom + Cardmarket + Manapool + Cardhoarder, local SQLite cache |
 
 ## Tools
@@ -23,6 +24,9 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 - **`edhrec_top_cards`** - Top EDH cards by time period (year/month/week).
 - **`edhrec_search_commanders`** - Browse commanders by color identity.
 
+### Commander Spellbook
+- **`spellbook_combos`** - Search combos by card name(s) and/or color identity (e.g. `ub`), most popular first. Returns the cards, what the combo produces, step-by-step instructions, and a link.
+
 ### Scryfall
 - **`scryfall_card`** - Full card data including oracle text, mana cost, type, legality, pricing, and image. Handles double-faced and split cards.
 - **`scryfall_search`** - Search using [Scryfall syntax](https://scryfall.com/docs/syntax) (e.g. `c:ug type:creature cmc<=3`).
@@ -30,8 +34,8 @@ A Model Context Protocol (MCP) server for Magic: The Gathering Commander/EDH. Pr
 
 ### Deck Tools
 - **`import_deck`** - Import a deck from an Archidekt or Moxfield URL.
-- **`analyze_deck`** - Import and analyze a deck: mana curve, color distribution, type breakdown, mana base evaluation, and EDHRec-based card suggestions.
-- **`build_deck`** - Build a full 100-card Commander deck from a card name. Supports budget tiers and theme filtering. If the card isn't a commander, suggests commanders that use it.
+- **`analyze_deck`** - Import and analyze a deck: mana curve, color distribution, type breakdown, mana base evaluation, EDHRec-based card suggestions, and a `bracket` report (Game Changers from Scryfall, Commander Spellbook combos in the deck and one card away, and a `minimum_bracket` floor; mass land denial / extra-turn cards are checked for Archidekt decks).
+- **`build_deck`** - Build a full 100-card Commander deck from a card name. Supports budget tiers and theme filtering. Includes the same `bracket` report. If the card isn't a commander, suggests commanders that use it.
 
 ### Pricing
 - **`price_deck`** - Price a deck from Archidekt/Moxfield on both TCGPlayer and Card Kingdom. Compares total cost and card availability with a recommendation. Uses Scryfall's batched `/cards/collection` endpoint plus 8-way concurrent EDHRec lookups, so a 100-card deck typically prices in ~10–20 s (down from 2–3 minutes in earlier versions). Note: a deck full of edge-case prints can produce a brief request burst that briefly trips Scryfall's per-IP rate limiter; if a follow-on Scryfall-backed tool (`scryfall_card`, `scryfall_search`, `scryfall_rulings`) returns `"Scryfall rate limit exceeded after retries"`, wait ~30 s and retry. (The internal throttle race that used to amplify this was fixed in 0.2.0.)

@@ -5,6 +5,54 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-08 — Commander Spellbook combos + bracket report
+
+### Added
+- **`spellbook_combos` tool** — searches Commander Spellbook by card
+  name(s) and/or color identity, most popular first. New
+  `clients/spellbook.py` (own deadline/self-healing client, 30min cache).
+- **Bracket report** in `analyze_deck` and `build_deck` (`bracket` key):
+  Game Changers in the deck (live from Scryfall `is:gamechanger`),
+  Spellbook combos already in the deck, combos one card away, and a
+  `minimum_bracket` floor (Game Changers: 1+ → 3, 4+ → 4; short
+  game-winning combo → 4). Each half degrades independently if its
+  upstream is down.
+
+### Fixed
+- `analyze_deck`, `price_deck` and the bracket report no longer double-count
+  Archidekt cards that carry several category tags, nor count Maybeboard /
+  Sideboard / Companion cards (new `collection.mainboard_cards`). Separate
+  entries of the same name (e.g. two Forest printings) are now summed in
+  `price_deck` instead of the later one being dropped.
+- Archidekt decks parse a real `type_line` again (Archidekt replaced
+  `typeLine` with `types`/`superTypes`/`subTypes`), so `analyze_deck` reports
+  land count, type breakdown and mana curve instead of zeros.
+- `deck_card_counts` (pull/buy lists, committed-quantity math) now uses
+  `mainboard_cards`: no Maybeboard/Sideboard cards, and separate entries of
+  the same printing are summed instead of dropped.
+- `avg_cmc` in `analyze_deck` is computed from real mana values, not the
+  curve capped at 7.
+- The bracket report degrades per upstream on *any* error instead of
+  failing `analyze_deck`/`build_deck`.
+- `build_deck` cheapest-land truncation now actually sorts by price (the
+  price lookup read data the entries never carried).
+- `build_deck` accepts legendary Vehicles/Spacecraft, Backgrounds and cards
+  that say they can be your commander, not just legendary creatures.
+- `spellbook_combos` validates `color_identity` (WUBRGC letters) and card
+  names instead of splicing raw text into the query.
+- Bracket report runs the Scryfall and Spellbook calls concurrently.
+
+### Notes
+- Archidekt's per-card `gameChanger` / `extraTurns` / `massLandDenial`
+  flags are now parsed and feed the bracket report: mass land denial or
+  3+ extra-turn cards raise the floor to 4, and the Archidekt Game Changer
+  flag is the fallback if Scryfall is down. Moxfield decks have no such
+  flags, so those checks are skipped for them.
+- The bracket value is a floor, not a verdict: mass land denial and
+  extra-turn chains are not detected.
+- Inspired by a review of the `mtg-mcp` PyPI package, which has these
+  features; no code was copied.
+
 ## [0.6.2] — 2026-07-31 — Tool-level timeout backstop
 
 ### Added

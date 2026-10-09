@@ -205,6 +205,16 @@ class ArchidektClient:
 
         return results
 
+    @staticmethod
+    def _type_line(oracle: dict) -> str | None:
+        """Archidekt dropped ``typeLine``; rebuild "Legendary Creature — Elf"
+        from superTypes / types / subTypes (falling back to the old key)."""
+        main = " ".join((oracle.get("superTypes") or []) + (oracle.get("types") or []))
+        if not main:
+            return oracle.get("typeLine")
+        subs = " ".join(oracle.get("subTypes") or [])
+        return f"{main} — {subs}" if subs else main
+
     def _parse_deck(self, data: dict) -> dict:
         """Parse Archidekt deck response into a normalized format."""
         # Group cards by category
@@ -217,12 +227,20 @@ class ArchidektClient:
 
             edition_code = (card_data.get("edition") or {}).get("editioncode")
             card = {
+                # Same entry appears under each of its categories; this id
+                # lets callers tell "one card, many tags" from "two copies".
+                "entry_id": entry.get("id"),
                 "name": oracle.get("name") or card_data.get("displayName") or "Unknown",
                 "quantity": quantity,
                 "cmc": oracle.get("cmc") or card_data.get("cmc"),
                 "colors": oracle.get("colors") or card_data.get("colors"),
                 "color_identity": oracle.get("colorIdentity") or card_data.get("colorIdentity"),
-                "type_line": oracle.get("typeLine"),
+                "type_line": self._type_line(oracle),
+                # Rule flags Archidekt computes per oracle card; used by the
+                # bracket report.
+                "game_changer": bool(oracle.get("gameChanger")),
+                "extra_turns": bool(oracle.get("extraTurns")),
+                "mass_land_denial": bool(oracle.get("massLandDenial")),
                 "edition": edition_code,
                 "set_code": edition_code.lower() if edition_code else None,
                 "collector_number": card_data.get("collectorNumber"),
@@ -232,11 +250,16 @@ class ArchidektClient:
             for cat in card_categories:
                 categories.setdefault(cat, []).append(card)
 
+        excluded = [
+            c["name"] for c in data.get("categories") or []
+            if isinstance(c, dict) and c.get("name") and not c.get("includedInDeck", True)
+        ]
         return {
             "name": data.get("name", "Unknown Deck"),
             "format": data.get("deckFormat"),
             "owner": data.get("owner", {}).get("username"),
             "categories": categories,
+            "excluded_categories": excluded,
             "card_count": sum(
                 entry.get("quantity", 1) for entry in data.get("cards", [])
             ),

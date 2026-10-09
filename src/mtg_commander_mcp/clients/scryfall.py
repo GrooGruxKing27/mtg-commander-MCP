@@ -255,6 +255,35 @@ class ScryfallClient:
             })
         return cards
 
+    async def get_game_changers(self) -> set[str]:
+        """Names of all Commander Game Changers (Scryfall ``is:gamechanger``).
+
+        Lowercased, and DFC/split cards also contribute their front-face name
+        so decklist names match either way. Cached with the client's default TTL.
+        """
+        cached = self._cache.get("game_changers")
+        if cached is not None:
+            return cached
+
+        names: set[str] = set()
+        path, params = "/cards/search", {"q": "is:gamechanger", "unique": "cards"}
+        for _ in range(5):  # list is ~50 cards; 175/page, so 1 page in practice
+            async with self._deadline():
+                data = await self._request_json("GET", path, params=params)
+            for card in data.get("data", []):
+                name = (card.get("name") or "").lower()
+                if name:
+                    names.add(name)
+                    names.add(name.split(" // ")[0])
+            next_page = data.get("next_page")
+            if not data.get("has_more") or not next_page:
+                break
+            path, params = next_page.replace(self.BASE_URL, ""), None
+
+        if names:
+            self._cache.set("game_changers", names)
+        return names
+
     async def get_rulings(self, name: str) -> list[dict]:
         """Get official rulings for a card by name."""
         # First get the card to find its ID

@@ -62,6 +62,42 @@ def _key(name: str | None, set_code, collector_number) -> PrintingKey | None:
     return (name, s, c)
 
 
+# Boards that are never part of the 100-card deck, whatever the source calls
+# them. Sources can add more via the parsed deck's ``excluded_categories``.
+NON_DECK_CATEGORIES = frozenset({"maybeboard", "sideboard", "companion", "companions"})
+
+
+def mainboard_cards(deck: dict) -> list[dict]:
+    """Cards actually in the deck, each physical entry exactly once.
+
+    Archidekt lists one entry under every category tag it carries, and the
+    deck also holds Maybeboard/Sideboard/Companion cards. Flattening
+    ``deck["categories"]`` naively therefore double-counts tagged cards and
+    counts cards that aren't in the 100. This skips non-deck categories and
+    dedupes by ``entry_id`` (falling back to object identity, which is
+    shared across categories within one parse). Two separate entries of the
+    same card (e.g. two Forest printings) are both kept.
+
+    Each returned card is a copy with ``board`` set to "Commander" if it
+    sits in a Commander category, else its first deck category.
+    """
+    skip = NON_DECK_CATEGORIES | {
+        str(c).lower() for c in deck.get("excluded_categories") or []
+    }
+    by_entry: dict = {}
+    for cat_name, cards in deck.get("categories", {}).items():
+        if cat_name.lower() in skip:
+            continue
+        for card in cards:
+            key = card.get("entry_id") or id(card)
+            existing = by_entry.get(key)
+            if existing is None:
+                by_entry[key] = {**card, "board": cat_name}
+            elif cat_name.lower() == "commander":
+                existing["board"] = cat_name
+    return list(by_entry.values())
+
+
 def aggregate_owned(rows: Iterable[dict]) -> dict[PrintingKey, dict]:
     """Group collection rows by ``(name, set_code, collector_number)``.
 
@@ -84,26 +120,25 @@ def aggregate_owned(rows: Iterable[dict]) -> dict[PrintingKey, dict]:
 def deck_card_counts(deck: dict) -> dict[PrintingKey, dict]:
     """Flatten a parsed deck (Archidekt/Moxfield shape) to ``{key: info}``.
 
-    Archidekt assigns cards to multiple user categories — the same card
-    entry appears in each. We dedupe by printing key, so a card listed
-    in both "Ramp" and "Mana" still counts once. A deck that genuinely
-    has two different printings of the same card (rare outside basic
-    lands) is preserved as two distinct keys.
+    Built on ``mainboard_cards``, so a card tagged with several Archidekt
+    categories counts once and Maybeboard/Sideboard/Companion cards are
+    ignored. Separate entries of the same printing (e.g. a foil and a
+    non-foil copy) have their quantities summed; genuinely different
+    printings stay distinct keys.
     """
     seen: dict[PrintingKey, dict] = {}
-    for cat_cards in deck.get("categories", {}).values():
-        for card in cat_cards:
-            key = _key(
-                card.get("name"),
-                card.get("set_code"),
-                card.get("collector_number"),
-            )
-            if key is None or key in seen:
-                continue
-            seen[key] = {
-                "quantity": int(card.get("quantity", 1)),
-                "scryfall_id": card.get("scryfall_id"),
-            }
+    for card in mainboard_cards(deck):
+        key = _key(
+            card.get("name"),
+            card.get("set_code"),
+            card.get("collector_number"),
+        )
+        if key is None:
+            continue
+        entry = seen.setdefault(key, {"quantity": 0, "scryfall_id": None})
+        entry["quantity"] += int(card.get("quantity", 1))
+        if not entry["scryfall_id"] and card.get("scryfall_id"):
+            entry["scryfall_id"] = card["scryfall_id"]
     return seen
 
 

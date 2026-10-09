@@ -45,6 +45,7 @@ from mtg_commander_mcp.clients.moxfield import MoxfieldClient, MoxfieldError
 from mtg_commander_mcp.clients.rules import RulesClient, RulesError
 from mtg_commander_mcp.clients.delver import DelverClient, DelverError
 from mtg_commander_mcp.clients.mtgjson import MTGJSONClient, MTGJSONError
+from mtg_commander_mcp.clients.spellbook import SpellbookClient, SpellbookError
 from mtg_commander_mcp import collection as col_lib
 from mtg_commander_mcp import storage
 
@@ -57,6 +58,7 @@ moxfield = MoxfieldClient()
 rules = RulesClient()
 delver = DelverClient()
 mtgjson = MTGJSONClient()
+spellbook = SpellbookClient()
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,31 @@ async def edhrec_commander_combos(
         combos = await edhrec.get_combos(commander_name)
         return {"combos": combos[:limit]}
     except EDHRecError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+@bounded()
+async def spellbook_combos(
+    cards: list[str] | None = None,
+    color_identity: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Search Commander Spellbook for combos, most popular first.
+
+    Returns each combo's cards, what it produces, step-by-step description,
+    color identity, and bracket tag. Independent of EDHRec's combo data and
+    covers far more combos.
+
+    Args:
+        cards: Card names that must ALL appear in the combo (optional)
+        color_identity: Restrict to combos castable in these colors, e.g.
+            "ug" or "wubr" (optional). Provide cards, color_identity, or both.
+        limit: Max combos to return (default 10, max 50)
+    """
+    try:
+        return {"combos": await spellbook.search_combos(cards, color_identity, limit)}
+    except SpellbookError as e:
         return {"error": str(e)}
 
 
@@ -298,7 +325,8 @@ async def analyze_deck(url: str) -> dict:
     """Import and analyze a Commander deck from Archidekt or Moxfield.
 
     Returns mana curve, color distribution, card type breakdown, mana base
-    suggestions, and card recommendations based on EDHRec synergy data.
+    suggestions, card recommendations based on EDHRec synergy data, and a
+    bracket report (Game Changers, Commander Spellbook combos, minimum bracket).
 
     Args:
         url: Full URL to the deck
@@ -309,19 +337,18 @@ async def analyze_deck(url: str) -> dict:
             return deck
 
         # Collect all cards across categories
-        all_cards = []
-        commander_name = None
-        for cat_name, cards in deck.get("categories", {}).items():
-            for card in cards:
-                all_cards.append({**card, "board": cat_name})
-                if cat_name.lower() == "commander" and commander_name is None:
-                    commander_name = card.get("name")
+        all_cards = col_lib.mainboard_cards(deck)
+        commander_name = next(
+            (c.get("name") for c in all_cards if c["board"].lower() == "commander"),
+            None,
+        )
 
         # Mana curve
         mana_curve: dict[int, int] = {}
         type_counts: dict[str, int] = {}
         land_count = 0
         nonland_count = 0
+        cmc_total = 0.0  # raw (uncapped) so the 7+ bucket doesn't skew avg_cmc
 
         for card in all_cards:
             qty = card.get("quantity", 1)
@@ -333,6 +360,7 @@ async def analyze_deck(url: str) -> dict:
                 if bucket > 7:
                     bucket = 7  # 7+ bucket
                 mana_curve[bucket] = mana_curve.get(bucket, 0) + qty
+                cmc_total += float(cmc) * qty
 
             # Type counting
             if "Land" in type_line:
@@ -388,16 +416,50 @@ async def analyze_deck(url: str) -> dict:
             "commander": commander_name,
             "card_count": total_cards,
             "mana_curve": mana_curve_sorted,
-            "avg_cmc": round(
-                sum(k * v for k, v in mana_curve.items()) / max(sum(mana_curve.values()), 1), 2
-            ),
+            "avg_cmc": round(cmc_total / max(sum(mana_curve.values()), 1), 2),
             "type_breakdown": type_counts,
             "mana_base": mana_base,
             "edhrec_suggestions": edhrec_suggestions,
             "categories": {k: len(v) for k, v in deck.get("categories", {}).items()},
+            "bracket": await _bracket_report(
+                [commander_name] if commander_name else [],
+                [c["name"] for c in all_cards if c.get("name")],
+                flags=_card_flags(all_cards),
+            ),
         }
     except (ArchidektError, MoxfieldError) as e:
         return {"error": str(e)}
+
+
+def _can_be_commander(card: dict) -> bool:
+    """Legendary creatures, legendary Vehicles/Spacecraft with P/T, Backgrounds,
+    and anything whose text says it can be your commander."""
+    type_line = card.get("type_line") or ""
+    text = (card.get("oracle_text") or "").lower()
+    if "can be your commander" in text:
+        return True
+    if not card.get("is_legendary"):
+        return False
+    if card.get("is_creature") or "Background" in type_line:
+        return True
+    return ("Vehicle" in type_line or "Spacecraft" in type_line) and bool(
+        card.get("power")
+    )
+
+
+def _edhrec_price(prices: dict | None) -> float | None:
+    """First parseable Card Kingdom / TCGPlayer price from EDHRec price data
+    (values are either bare numbers or {"price": ...} dicts)."""
+    for key in ("cardkingdom", "tcgplayer"):
+        val = (prices or {}).get(key)
+        if isinstance(val, dict):
+            val = val.get("price")
+        if val is not None:
+            try:
+                return float(str(val).replace("$", "").replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+    return None
 
 
 @mcp.tool()
@@ -418,7 +480,8 @@ async def build_deck(
 
     The result may contain fewer than 100 cards when a tight budget excludes
     too many recommended cards; in that case the response includes a
-    `warning` field listing the shortfall.
+    `warning` field listing the shortfall. Also includes a `bracket` report
+    (Game Changers, Spellbook combos, minimum bracket).
 
     Args:
         card_name: A card name to build around
@@ -434,7 +497,7 @@ async def build_deck(
     except ScryfallError as e:
         return {"error": f"Could not find card: {e}"}
 
-    is_commander = card_data.get("is_legendary") and card_data.get("is_creature")
+    is_commander = _can_be_commander(card_data)
 
     if not is_commander:
         # Not a commander — suggest some
@@ -499,20 +562,7 @@ async def build_deck(
     if price_cap < float("inf"):
         filtered = {}
         for name, card in deck_cards.items():
-            price = None
-            prices = card.get("prices")
-            if prices:
-                # EDHRec prices are nested: {"cardkingdom": {"price": 2.29}, "tcgplayer": {"price": 1.50}}
-                for key in ["cardkingdom", "tcgplayer"]:
-                    val = prices.get(key)
-                    if isinstance(val, dict):
-                        val = val.get("price")
-                    if val is not None:
-                        try:
-                            price = float(str(val).replace("$", "").replace(",", ""))
-                            break
-                        except (ValueError, TypeError):
-                            continue
+            price = _edhrec_price(card.get("prices"))
             if price is None or price <= price_cap:
                 filtered[name] = card
         deck_cards = filtered
@@ -620,18 +670,11 @@ async def build_deck(
         if budget == "no_limit":
             land_cards = land_cards[:target_lands]
         else:
+            # Grouped entries carry only name/quantity/synergy, so look
+            # prices up from the EDHRec card data they came from.
             def _land_price(c: dict) -> float:
-                prices = c.get("prices") or {}
-                for key in ("cardkingdom", "tcgplayer"):
-                    val = prices.get(key)
-                    if isinstance(val, dict):
-                        val = val.get("price")
-                    if val is not None:
-                        try:
-                            return float(str(val).replace("$", "").replace(",", ""))
-                        except (ValueError, TypeError):
-                            continue
-                return float("inf")
+                price = _edhrec_price((deck_cards.get(c["name"]) or {}).get("prices"))
+                return float("inf") if price is None else price
 
             land_cards = sorted(land_cards, key=_land_price)[:target_lands]
         grouped["Lands"] = land_cards
@@ -682,6 +725,11 @@ async def build_deck(
         "theme": theme,
         "total_cards": total_cards,
         "deck": final_deck,
+        "bracket": await _bracket_report(
+            [c["name"] for c in final_deck.get("Commander", []) if c.get("name")],
+            [c["name"] for cat, cards in final_deck.items() if cat != "Commander"
+             for c in cards if c.get("name")],
+        ),
     }
 
     # Honesty: a Commander deck is 99 + commander = 100. If we couldn't fill
@@ -702,6 +750,127 @@ async def build_deck(
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Bracket estimation
+# ---------------------------------------------------------------------------
+
+
+def _card_flags(cards: list[dict]) -> dict[str, list[str]] | None:
+    """Per-card rule flags a deck source supplies (Archidekt does), or None
+    when the source doesn't carry them (Moxfield)."""
+    if not any("mass_land_denial" in c for c in cards):
+        return None
+    return {
+        flag: sorted({c["name"] for c in cards if c.get(flag) and c.get("name")})
+        for flag in ("mass_land_denial", "extra_turns", "game_changer")
+    }
+
+
+async def _bracket_report(
+    commanders: list[str],
+    card_names: list[str],
+    flags: dict[str, list[str]] | None = None,
+) -> dict:
+    """Heuristic Commander Bracket floor from Game Changers and combos.
+
+    Official brackets: 1-2 allow no Game Changers; 3 allows up to 3; 4-5 are
+    unrestricted. Combos that win in a few cards push a deck to 4+. This can
+    only prove a *minimum* bracket: it does not detect mass land denial or
+    extra-turn chains, and intent/table talk decides the rest. Each half
+    degrades independently if its upstream is unavailable.
+    """
+    report: dict = {}
+    # One entry per distinct card: multi-tagged or repeated names must not
+    # inflate the Game Changer count or the Spellbook request.
+    commanders = list(dict.fromkeys(commanders))
+    seen = {n.lower() for n in commanders}
+    unique_cards = []
+    for n in card_names:
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            unique_cards.append(n)
+    card_names = unique_cards
+
+    # Independent upstreams: run together so the added latency is the
+    # slower of the two, not the sum.
+    gc_result, combo_result = await asyncio.gather(
+        scryfall.get_game_changers(),
+        spellbook.find_deck_combos(commanders, card_names),
+        return_exceptions=True,
+    )
+
+    # The bracket report is auxiliary: whatever an upstream does, degrade that
+    # half instead of failing the whole deck tool.
+    if isinstance(gc_result, BaseException):
+        if not isinstance(gc_result, ScryfallError):
+            logger.warning("Game Changers lookup failed: %r", gc_result)
+        gcs = None
+        report["game_changers"] = {"error": str(gc_result) or type(gc_result).__name__}
+    else:
+        gcs = sorted(n for n in commanders + card_names if n.lower() in gc_result)
+        report["game_changers"] = {"count": len(gcs), "cards": gcs}
+
+    if isinstance(combo_result, BaseException):
+        if not isinstance(combo_result, SpellbookError):
+            logger.warning("Spellbook combo lookup failed: %r", combo_result)
+        winning = None
+        report["combos"] = {"error": str(combo_result) or type(combo_result).__name__}
+    else:
+        found = combo_result
+        # Combos of 2-3 cards that end the game are what the bracket rules
+        # call out ("two-card combos"); longer ones are rarely a bracket issue.
+        winning = [
+            c for c in found["included"]
+            if len(c["cards"]) <= 3 and any("win" in r.lower() for r in c["results"])
+        ]
+        report["combos"] = {
+            "in_deck": found["included"],
+            "short_game_winning": len(winning),
+            "one_card_away": found["one_card_away"],
+        }
+
+    if gcs is None and flags is not None:
+        # Scryfall was unavailable; fall back to the deck site's own flags.
+        gcs = flags.get("game_changer") or []
+        report["game_changers"] = {
+            "count": len(gcs), "cards": gcs, "source": "deck-site flags",
+        }
+
+    floor = 1
+    reasons = []
+    if gcs is not None:
+        if len(gcs) > 3:
+            floor = max(floor, 4)
+            reasons.append(f"{len(gcs)} Game Changers (bracket 3 allows at most 3)")
+        elif gcs:
+            floor = max(floor, 3)
+            reasons.append(f"{len(gcs)} Game Changer(s) (not allowed in brackets 1-2)")
+    if winning:
+        floor = max(floor, 4)
+        reasons.append(f"{len(winning)} short game-winning combo(s)")
+    if flags is not None:
+        mld = flags.get("mass_land_denial") or []
+        turns = flags.get("extra_turns") or []
+        report["flags"] = {"mass_land_denial": mld, "extra_turns": turns}
+        if mld:
+            floor = max(floor, 4)
+            reasons.append(f"mass land denial: {', '.join(mld)}")
+        if len(turns) >= 3:
+            floor = max(floor, 4)
+            reasons.append(
+                f"{len(turns)} extra-turn cards (heuristic: 3+ can chain; "
+                "the rules ban intentional chaining, not a count)"
+            )
+    report["minimum_bracket"] = floor
+    report["reasons"] = reasons
+    report["note"] = (
+        "A floor, not a verdict. Mass land denial and extra-turn cards are only "
+        "checked when the deck source flags them (Archidekt); a deck may sit "
+        "higher by intent."
+    )
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -726,17 +895,19 @@ async def price_deck(url: str) -> dict:
     except (ArchidektError, MoxfieldError) as e:
         return {"error": str(e)}
 
-    # Collect unique cards. Archidekt assigns each card to one or more
-    # categories, so the same card appears multiple times in deck["categories"];
-    # dedupe by name to avoid double-counting price.
-    seen_names: set[str] = set()
-    all_cards = []
-    for cards in deck.get("categories", {}).values():
-        for card in cards:
-            name = card.get("name")
-            if name and name not in seen_names:
-                seen_names.add(name)
-                all_cards.append(card)
+    # One row per card name with quantities summed across entries: mainboard_cards
+    # already removes multi-category repeats and non-deck boards, and separate
+    # entries of the same name (two Forest printings) all need to be priced.
+    by_name: dict[str, dict] = {}
+    for card in col_lib.mainboard_cards(deck):
+        name = card.get("name")
+        if not name:
+            continue
+        if name in by_name:
+            by_name[name]["quantity"] += card.get("quantity", 1)
+        else:
+            by_name[name] = {**card, "quantity": card.get("quantity", 1)}
+    all_cards = list(by_name.values())
 
     names = [c["name"] for c in all_cards]
 
