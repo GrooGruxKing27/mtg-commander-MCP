@@ -1,0 +1,136 @@
+{
+  "dxt_version": "0.1",
+  "name": "mtg-commander",
+  "display_name": "MTG Commander (EDHRec)",
+  "version": "0.7.0",
+  "description": "EDHRec, Scryfall, MTG Rules, Archidekt, Moxfield, and collection support for Magic: The Gathering Commander/EDH.",
+  "long_description": "Local MCP server providing Magic: The Gathering Commander/EDH tooling: EDHRec recommendations, themes, combos, and commander browsing; Commander Spellbook combo search; bracket / Game Changers report on deck analysis and builds; Scryfall card lookup, search, and rulings; full 100-card deck building; Archidekt and Moxfield deck import and pricing; Delver Lens collection import and analysis; cross-deck card allocation; MTGJSON-backed local pricing cache; per-marketplace whole-deck buy lists; and a searchable MTG Comprehensive Rules index.\n\nThis package launches the existing Python MCP server in-place from /Users/williamtreadway/Documents/EDHrec-MCP using uv. It does not bundle Python or the project — the source repo and its .venv must remain at that path.",
+  "author": {
+    "name": "William Treadway",
+    "url": "https://github.com/GrooGruxKing27/mtg-commander-MCP"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GrooGruxKing27/mtg-commander-MCP"
+  },
+  "homepage": "https://github.com/GrooGruxKing27/mtg-commander-MCP",
+  "license": "MIT",
+  "keywords": [
+    "mtg",
+    "magic",
+    "commander",
+    "edh",
+    "edhrec",
+    "scryfall",
+    "archidekt",
+    "moxfield",
+    "tcg",
+    "deck-builder"
+  ],
+  "server": {
+    "type": "python",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "/Users/williamtreadway/.local/bin/uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/williamtreadway/Documents/EDHrec-MCP",
+        "--no-editable",
+        "mtg-commander-mcp"
+      ],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "edhrec_commander_recommendations",
+      "description": "Get recommended cards for a Commander deck from EDHRec."
+    },
+    {
+      "name": "edhrec_commander_combos",
+      "description": "Get popular combos for a commander from EDHRec."
+    },
+    {
+      "name": "spellbook_combos",
+      "description": "Search Commander Spellbook for combos by card names and/or color identity, most popular first."
+    },
+    {
+      "name": "edhrec_commander_themes",
+      "description": "Get available themes/archetypes for a commander from EDHRec."
+    },
+    {
+      "name": "edhrec_top_cards",
+      "description": "Get the top EDH cards by time period from EDHRec."
+    },
+    {
+      "name": "edhrec_search_commanders",
+      "description": "Browse commanders by color identity from EDHRec."
+    },
+    {
+      "name": "scryfall_card",
+      "description": "Look up a card on Scryfall. Returns full card data including oracle text, prices, EDHRec rank, and image URI."
+    },
+    {
+      "name": "scryfall_search",
+      "description": "Search for cards using Scryfall search syntax."
+    },
+    {
+      "name": "scryfall_rulings",
+      "description": "Get official rulings for a card from Scryfall."
+    },
+    {
+      "name": "import_deck",
+      "description": "Import a deck from an Archidekt or Moxfield URL."
+    },
+    {
+      "name": "analyze_deck",
+      "description": "Import and analyze a Commander deck from Archidekt or Moxfield."
+    },
+    {
+      "name": "build_deck",
+      "description": "Build a full 100-card Commander deck."
+    },
+    {
+      "name": "price_deck",
+      "description": "Price out a deck from Archidekt or Moxfield on TCGPlayer and Card Kingdom."
+    },
+    {
+      "name": "import_collection",
+      "description": "Import a Magic collection from a Delver Lens CSV export."
+    },
+    {
+      "name": "collection_summary",
+      "description": "Stats on the persisted active collection."
+    },
+    {
+      "name": "compute_card_allocation",
+      "description": "Compute, across the active collection and the listed decks, how to allocate cards to a new deck."
+    },
+    {
+      "name": "pull_and_buy_lists",
+      "description": "Cross-reference your collection, existing decks, and a new deck to produce a pull list and a per-marketplace buy list."
+    },
+    {
+      "name": "refresh_pricing_data",
+      "description": "Refresh the local MTGJSON pricing cache."
+    },
+    {
+      "name": "pricing_cache_status",
+      "description": "Inspect the local MTGJSON pricing cache without modifying it."
+    },
+    {
+      "name": "mtg_rules",
+      "description": "Search the MTG Comprehensive Rules by keyword or rule number."
+    }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}
