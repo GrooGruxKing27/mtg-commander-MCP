@@ -5,7 +5,12 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-09
+
 ### Fixed
+- **Stale installs:** `[tool.uv] cache-keys` now include `src/**/*.py`, so
+  `uv run --no-editable` (the Claude Desktop launch command) picks up code
+  changes instead of reusing a cached wheel.
 - **`collection_summary` timing out on large collections.** A ~10k-card
   collection needs ~130 Scryfall batches, more than one MCP call can wait
   for. It now resolves within a 35s budget (per-batch cached, no per-card

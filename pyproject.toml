@@ -1,6 +1,6 @@
 [project]
 name = "mtg-commander-mcp"
-version = "0.7.0"
+version = "0.7.1"
 description = "MCP server for Magic: The Gathering Commander/EDH - EDHRec, Scryfall, Archidekt, Moxfield, MTG Rules, and Delver Lens collection support"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,6 +24,12 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.26",
 ]
+
+# `uv run --no-editable` (how Claude Desktop launches this) reuses a cached
+# wheel unless a cache key changed; by default only pyproject.toml counts, so
+# source edits were silently ignored. Track the sources too.
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

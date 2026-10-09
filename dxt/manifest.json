@@ -2,7 +2,7 @@
   "dxt_version": "0.1",
   "name": "mtg-commander",
   "display_name": "MTG Commander (EDHRec)",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "EDHRec, Scryfall, MTG Rules, Archidekt, Moxfield, and collection support for Magic: The Gathering Commander/EDH.",
   "long_description": "Local MCP server providing Magic: The Gathering Commander/EDH tooling: EDHRec recommendations, themes, combos, and commander browsing; Commander Spellbook combo search; bracket / Game Changers report on deck analysis and builds; Scryfall card lookup, search, and rulings; full 100-card deck building; Archidekt and Moxfield deck import and pricing; Delver Lens collection import and analysis; cross-deck card allocation; MTGJSON-backed local pricing cache; per-marketplace whole-deck buy lists; and a searchable MTG Comprehensive Rules index.\n\nThis package launches the existing Python MCP server in-place from /Users/williamtreadway/Documents/EDHrec-MCP using uv. It does not bundle Python or the project — the source repo and its .venv must remain at that path.",
   "author": {
