@@ -84,10 +84,10 @@ class ScryfallClient:
             discard_async_client(client)
 
     @asynccontextmanager
-    async def _deadline(self):
-        """Bound a logical call to TOTAL_DEADLINE and self-heal on failure."""
+    async def _deadline(self, limit: float | None = None):
+        """Bound a logical call to TOTAL_DEADLINE (or ``limit``) and self-heal on failure."""
         try:
-            async with asyncio.timeout(self.TOTAL_DEADLINE):
+            async with asyncio.timeout(min(limit or self.TOTAL_DEADLINE, self.TOTAL_DEADLINE)):
                 yield
         except TimeoutError as e:
             self._reset_client()
@@ -305,7 +305,10 @@ class ScryfallClient:
         ]
 
     async def get_collection(
-        self, names: list[str]
+        self,
+        names: list[str],
+        time_budget: float | None = None,
+        deferred: list[str] | None = None,
     ) -> tuple[dict[str, dict], list[str]]:
         """Batch-look up cards by name via /cards/collection.
 
@@ -320,9 +323,15 @@ class ScryfallClient:
         Up to 75 names per HTTP request, so a 100-card deck costs 2 round-
         trips instead of 100 fuzzy lookups.
 
-        Results are cached for ``Cache.ttl`` (default 5min) keyed on the input
-        name set, so repeating the same `price_deck` call within that window
-        is free.
+        Results are cached for ``Cache.ttl`` keyed on the input name set, so
+        repeating the same `price_deck` call within that window is free.
+
+        ``time_budget`` (seconds) stops starting new batches once exceeded;
+        names in skipped batches are appended to ``deferred`` and the partial
+        result is returned. Each batch is cached on its own, so a repeat call
+        resumes where the last one stopped instead of starting over. Needed
+        for 10k-card collections (~130 batches), which can't finish inside
+        one MCP call.
         """
         if not names:
             return {}, []
@@ -343,19 +352,48 @@ class ScryfallClient:
         name_lookup = {n.lower(): n for n in names}
         valid_inputs = set(name_lookup.values())
 
+        started = time.monotonic()
+        partial = False
+        if time_budget is not None:
+            # Stable order so per-batch cache keys line up across calls.
+            names = sorted(names)
         for batch_start in range(0, len(names), 75):
             batch = names[batch_start : batch_start + 75]
             identifiers = [{"name": n} for n in batch]
+            batch_key = f"collection-batch:{frozenset(batch)}"
 
-            # Deadline per batch (not per call): a large collection can
-            # legitimately take many batches, but no single batch should be
-            # able to hang the tool.
-            async with self._deadline():
-                data = await self._request_json(
-                    "POST",
-                    "/cards/collection",
-                    json_body={"identifiers": identifiers},
-                )
+            data = self._cache.get(batch_key)
+            if data is None:
+                if time_budget is not None and time.monotonic() - started > time_budget:
+                    partial = True
+                    if deferred is not None:
+                        deferred.extend(batch)
+                    continue
+                # Deadline per batch (not per call): a large collection can
+                # legitimately take many batches, but no single batch should
+                # be able to hang the tool.
+                try:
+                    remaining = (
+                        max(5.0, time_budget + 10.0 - (time.monotonic() - started))
+                        if time_budget is not None else None
+                    )
+                    async with self._deadline(remaining):
+                        data = await self._request_json(
+                            "POST",
+                            "/cards/collection",
+                            json_body={"identifiers": identifiers},
+                        )
+                except ScryfallError as e:
+                    # Budgeted callers keep what they've resolved so far; a
+                    # rate-limit burst shouldn't discard 100 good batches.
+                    if time_budget is None or not result:
+                        raise
+                    logger.warning("Stopping collection scan early: %s", e)
+                    partial = True
+                    if deferred is not None:
+                        deferred.extend(names[batch_start:])
+                    break
+                self._cache.set(batch_key, data)
 
             matched_in_batch: set[str] = set()
             for card in data.get("data", []):
@@ -386,7 +424,8 @@ class ScryfallClient:
                     not_found.append(name)
                     not_found_set.add(name)
 
-        self._cache.set(cache_key, (result, not_found))
+        if not partial:
+            self._cache.set(cache_key, (result, not_found))
         return result, not_found
 
     async def get_card_price(self, name: str) -> dict:

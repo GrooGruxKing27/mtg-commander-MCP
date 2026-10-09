@@ -276,3 +276,29 @@ async def test_get_collection_retries_429(fake_sleep):
     found, _ = await sc.get_collection(["Sol Ring"])
     assert sorted(found) == ["Sol Ring"]
     assert handler.state["posts"] == 2  # 429 then success — previously fatal
+
+
+@pytest.mark.asyncio
+async def test_get_collection_time_budget_defers_and_resumes():
+    """A zero budget defers uncached batches; a repeat call resumes from the
+    per-batch cache instead of re-requesting what was already resolved."""
+    sc = ScryfallClient()
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        idents = json.loads(request.content)["identifiers"]
+        calls.append(len(idents))
+        return httpx.Response(
+            200, json={"data": [{"name": i["name"]} for i in idents], "not_found": []}
+        )
+
+    install_transport(sc, handler)
+    names = [f"Card {i:03d}" for i in range(160)]  # 3 batches of 75/75/10
+
+    deferred: list[str] = []
+    found, _ = await sc.get_collection(names, time_budget=-1, deferred=deferred)
+    assert found == {} and len(deferred) == 160 and calls == []
+
+    deferred = []
+    found, _ = await sc.get_collection(names, time_budget=100, deferred=deferred)
+    assert len(found) == 160 and deferred == [] and calls == [75, 75, 10]

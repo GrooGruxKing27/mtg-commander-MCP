@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 # into a fast, explicit error instead of a silent hang that lasts until the
 # MCP host's own multi-minute timeout kicks in.
 TOOL_DEADLINE = 55.0
+# Scryfall-resolution budget for collection_summary; leaves room under
+# TOOL_DEADLINE for the in-flight batch and summing.
+SUMMARY_TIME_BUDGET = 35.0
 
 
 def bounded(seconds: float = TOOL_DEADLINE):
@@ -1073,7 +1076,11 @@ async def price_deck(url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_rows(rows: list[dict]) -> tuple[list[dict], dict, list[dict]]:
+async def _resolve_rows(
+    rows: list[dict],
+    time_budget: float | None = None,
+    deferred: list[str] | None = None,
+) -> tuple[list[dict], dict, list[dict]]:
     """Run a parsed Delver CSV through Scryfall to canonicalize names
     and capture pricing data.
 
@@ -1091,7 +1098,9 @@ async def _resolve_rows(rows: list[dict]) -> tuple[list[dict], dict, list[dict]]
 
     names = list({r["name"] for r in rows if r.get("name")})
     try:
-        scryfall_data, not_found = await scryfall.get_collection(names)
+        scryfall_data, not_found = await scryfall.get_collection(
+            names, time_budget=time_budget, deferred=deferred
+        )
     except ScryfallError as e:
         logger.warning("Scryfall batch resolve failed: %s", e)
         return [], {}, [{"row": r, "reason": str(e)} for r in rows]
@@ -1099,7 +1108,9 @@ async def _resolve_rows(rows: list[dict]) -> tuple[list[dict], dict, list[dict]]
     # Per-card fuzzy fallback for misses. Bounded fan-out (matches
     # price_deck's pattern at server.py:752) so a heavily-misspelled
     # CSV doesn't burst Scryfall's per-IP limiter.
-    if not_found:
+    # Skipped under a time budget: hundreds of misses x per-card retries is
+    # exactly what blows the host timeout on big collections.
+    if not_found and time_budget is None:
         sem = asyncio.Semaphore(4)
 
         async def _one(n: str):
@@ -1255,6 +1266,7 @@ def _load_active() -> tuple[list[dict] | None, str | None]:
 
 
 @mcp.tool()
+@bounded()
 async def collection_summary(refresh: bool = False) -> dict:
     """Stats on the persisted active collection.
 
@@ -1277,9 +1289,23 @@ async def collection_summary(refresh: bool = False) -> dict:
     if refresh:
         scryfall._cache._store.clear()
 
-    _, scryfall_data, _ = await _resolve_rows(rows or [])
+    # A large collection (~10k cards) needs >100 Scryfall batches, more than
+    # one MCP call can wait for. Resolve within a budget; repeat calls resume
+    # from the per-batch cache until `complete` is true.
+    deferred: list[str] = []
+    _, scryfall_data, _ = await _resolve_rows(
+        rows or [], time_budget=SUMMARY_TIME_BUDGET, deferred=deferred
+    )
+    pending = len(set(deferred))
+    if not scryfall_data and rows:
+        return {"error": "Scryfall is rate-limiting or unreachable; nothing resolved. "
+                         "Wait a minute and retry."}
 
     return {
+        "complete": pending == 0,
+        "pending_unique_cards": pending,
+        **({"note": "Value/color totals cover only resolved cards so far; "
+                    "call collection_summary again to continue."} if pending else {}),
         "unique_cards": len({r["name"] for r in rows}),
         "total_quantity": sum(int(r.get("quantity", 1)) for r in rows),
         "estimated_value_usd": _sum_collection_value(rows, scryfall_data),

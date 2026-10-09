@@ -5,6 +5,14 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- **`collection_summary` timing out on large collections.** A ~10k-card
+  collection needs ~130 Scryfall batches, more than one MCP call can wait
+  for. It now resolves within a 35s budget (per-batch cached, no per-card
+  fuzzy fallback) and returns `complete` / `pending_unique_cards`; repeat
+  the call until `complete` is true. A 429 mid-scan keeps partial progress
+  instead of discarding it, and the tool is wrapped in `@bounded()`.
+
 ## [0.7.0] — 2026-10-08 — Commander Spellbook combos + bracket report
 
 ### Added
