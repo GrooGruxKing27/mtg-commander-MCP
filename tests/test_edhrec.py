@@ -110,3 +110,33 @@ async def test_recovers_after_reset():
     with pytest.raises(EDHRecError):
         await ec._fetch("commanders/atraxa")
     assert await ec._fetch("commanders/atraxa") == {"header": "Atraxa"}
+
+
+@pytest.mark.asyncio
+async def test_theme_cannot_alter_request_path():
+    from mtg_commander_mcp.clients.edhrec import EDHRecClient
+
+    client = EDHRecClient()
+    seen = []
+
+    async def fake_fetch(path, _depth=0):
+        seen.append(path)
+        return {}
+
+    client._fetch = fake_fetch
+    await client.get_commander("Sol Ring", theme="../../top/year")
+    await client.get_commander("Sol Ring", theme="Aristocrats")
+    await client.get_commander("Sol Ring", theme="+1-1-counters")
+    assert seen == [
+        "commanders/sol-ring/top-year",
+        "commanders/sol-ring/aristocrats",
+        "commanders/sol-ring/+1-1-counters",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_theme_slug_raises():
+    from mtg_commander_mcp.clients.edhrec import EDHRecClient, EDHRecError
+
+    with pytest.raises(EDHRecError):
+        await EDHRecClient().get_commander("Sol Ring", theme="..")

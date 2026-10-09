@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 import httpx
 
@@ -129,6 +130,15 @@ class EDHRecClient:
     async def get_commander(self, name: str, theme: str | None = None) -> dict:
         """Get commander recommendations, optionally filtered by theme."""
         slug = to_slug(name)
+        if theme:
+            theme = theme.strip().lower()
+            # Taglink slugs from EDHRec (e.g. "+1-1-counters") pass through;
+            # anything else (spaces, "/", "?", "..") is slugged so it can't
+            # alter the request path.
+            if not re.fullmatch(r"[a-z0-9+\-]+", theme):
+                theme = to_slug(theme)
+            if not theme:
+                raise EDHRecError("Invalid theme")
         path = f"commanders/{slug}/{theme}" if theme else f"commanders/{slug}"
         data = await self._fetch(path)
 

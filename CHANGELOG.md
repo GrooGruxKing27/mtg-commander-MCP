@@ -12,6 +12,16 @@ All notable changes to this project. Format loosely follows
   fuzzy fallback) and returns `complete` / `pending_unique_cards`; repeat
   the call until `complete` is true. A 429 mid-scan keeps partial progress
   instead of discarding it, and the tool is wrapped in `@bounded()`.
+  The response also reports `unresolved_unique_cards` / `unresolved_sample`
+  so cards excluded from the totals are visible; `refresh=True` now clears
+  only collection lookups. New `ScryfallClient.get_collection_budgeted`.
+- **Split/double-faced cards missed by batch lookup.** `/cards/collection`
+  exact-matches one face, so `A // B` names always fell through to the slow
+  fuzzy path (129 misses in a 9.5k collection). The front face is now sent.
+- **`to_slug` mishandled diacritics** (`Éowyn` -> `owyn-...`); now
+  transliterated to ASCII (incl. Æ/ß/ø) so EDHRec lookups for accented names work.
+- **EDHRec `theme` argument** is validated/slugged so it can't alter the
+  request path.
 
 ## [0.7.0] — 2026-10-08 — Commander Spellbook combos + bracket report
 

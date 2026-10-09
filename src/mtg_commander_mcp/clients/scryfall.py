@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -36,6 +37,8 @@ class ScryfallClient:
     # card buy list) hits a transient 429 burst — 3 attempts often failed for
     # ~20% of cards.
     MAX_ATTEMPTS = 5
+    # How long past a get_collection_budgeted budget an in-flight batch may run.
+    BUDGET_GRACE = 10.0
 
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
@@ -304,11 +307,23 @@ class ScryfallClient:
             for r in data.get("data", [])
         ]
 
+    @staticmethod
+    def _names_key(prefix: str, names) -> str:
+        """Compact cache key for a set of names (avoids stringifying 10k names)."""
+        digest = hashlib.sha1("\x00".join(sorted(names)).encode()).hexdigest()
+        return f"{prefix}:{digest}"
+
+    @staticmethod
+    def _identifiers(batch: list[str]) -> list[dict]:
+        """Identifiers for /cards/collection. Scryfall exact-matches a single
+        face name, so 'Bedeck // Bedazzle' misses while 'Bedeck' hits; send
+        the front face for split/DFC names (the response is mapped back to
+        the full input name by the front-face fallback in ``_collection``)."""
+        fronts = dict.fromkeys(n.split(" // ")[0] for n in batch)
+        return [{"name": n} for n in fronts]
+
     async def get_collection(
-        self,
-        names: list[str],
-        time_budget: float | None = None,
-        deferred: list[str] | None = None,
+        self, names: list[str]
     ) -> tuple[dict[str, dict], list[str]]:
         """Batch-look up cards by name via /cards/collection.
 
@@ -325,85 +340,102 @@ class ScryfallClient:
 
         Results are cached for ``Cache.ttl`` keyed on the input name set, so
         repeating the same `price_deck` call within that window is free.
-
-        ``time_budget`` (seconds) stops starting new batches once exceeded;
-        names in skipped batches are appended to ``deferred`` and the partial
-        result is returned. Each batch is cached on its own, so a repeat call
-        resumes where the last one stopped instead of starting over. Needed
-        for 10k-card collections (~130 batches), which can't finish inside
-        one MCP call.
         """
+        found, not_found, _ = await self._collection(names, None)
+        return found, not_found
+
+    async def get_collection_budgeted(
+        self, names: list[str], time_budget: float
+    ) -> tuple[dict[str, dict], list[str], list[str]]:
+        """Like ``get_collection`` but stops starting new batches after
+        ``time_budget`` seconds; returns ``(found, not_found, deferred)``.
+
+        ``deferred`` holds names in batches that were skipped (budget spent,
+        or Scryfall started failing after some progress). Each batch is
+        cached on its own, so a repeat call resumes where this one stopped.
+        Needed for 10k-card collections (~130 batches), which can't finish
+        inside one MCP call.
+        """
+        return await self._collection(names, time_budget)
+
+    async def _collection(
+        self, names: list[str], time_budget: float | None
+    ) -> tuple[dict[str, dict], list[str], list[str]]:
         if not names:
-            return {}, []
+            return {}, [], []
 
         # Cache is keyed on the unordered set of names so re-pricing the
         # same deck (or two decks with overlapping cards re-issued in the
         # same window) skips the POSTs.
-        cache_key = f"collection:{frozenset(names)}"
+        cache_key = self._names_key("collection", names)
         cached = self._cache.get(cache_key)
         if cached is not None:
-            return cached
+            return (*cached, [])
 
         result: dict[str, dict] = {}
         not_found: list[str] = []
         not_found_set: set[str] = set()
+        deferred: list[str] = []
         # Lowercase->original lookup so we can map Scryfall's canonicalized
         # response name back to whatever case the caller passed in.
         name_lookup = {n.lower(): n for n in names}
         valid_inputs = set(name_lookup.values())
+        # Front-face -> every input sharing it, so 'Fire' and 'Fire // Ice'
+        # both resolve from the single card Scryfall returns for them.
+        by_front: dict[str, list[str]] = {}
+        for n in names:
+            by_front.setdefault(n.split(" // ")[0].lower(), []).append(n)
 
         started = time.monotonic()
-        partial = False
-        if time_budget is not None:
+        budgeted = time_budget is not None
+        if budgeted:
             # Stable order so per-batch cache keys line up across calls.
             names = sorted(names)
+        batches_done = 0
         for batch_start in range(0, len(names), 75):
             batch = names[batch_start : batch_start + 75]
-            identifiers = [{"name": n} for n in batch]
-            batch_key = f"collection-batch:{frozenset(batch)}"
+            batch_key = self._names_key("collection-batch", batch)
 
-            data = self._cache.get(batch_key)
+            data = self._cache.get(batch_key) if budgeted else None
             if data is None:
-                if time_budget is not None and time.monotonic() - started > time_budget:
-                    partial = True
-                    if deferred is not None:
-                        deferred.extend(batch)
+                elapsed = time.monotonic() - started
+                if budgeted and elapsed > time_budget:
+                    deferred.extend(batch)
                     continue
                 # Deadline per batch (not per call): a large collection can
                 # legitimately take many batches, but no single batch should
-                # be able to hang the tool.
+                # be able to hang the tool. A budgeted batch started just
+                # under the budget gets only the grace window to finish.
+                limit = (
+                    max(5.0, time_budget + self.BUDGET_GRACE - elapsed)
+                    if budgeted else None
+                )
                 try:
-                    remaining = (
-                        max(5.0, time_budget + 10.0 - (time.monotonic() - started))
-                        if time_budget is not None else None
-                    )
-                    async with self._deadline(remaining):
+                    async with self._deadline(limit):
                         data = await self._request_json(
                             "POST",
                             "/cards/collection",
-                            json_body={"identifiers": identifiers},
+                            json_body={"identifiers": self._identifiers(batch)},
                         )
                 except ScryfallError as e:
                     # Budgeted callers keep what they've resolved so far; a
                     # rate-limit burst shouldn't discard 100 good batches.
-                    if time_budget is None or not result:
+                    if not budgeted or batches_done == 0:
                         raise
                     logger.warning("Stopping collection scan early: %s", e)
-                    partial = True
-                    if deferred is not None:
-                        deferred.extend(names[batch_start:])
+                    deferred.extend(names[batch_start:])
                     break
-                self._cache.set(batch_key, data)
+                if budgeted:
+                    self._cache.set(batch_key, data)
+            batches_done += 1
 
             matched_in_batch: set[str] = set()
             for card in data.get("data", []):
                 # Match by lowercase name OR front-face name for DFCs
                 returned = card.get("name", "")
-                key = name_lookup.get(returned.lower())
-                if key is None:
-                    front = returned.split(" // ")[0]
-                    key = name_lookup.get(front.lower())
-                if key is not None:
+                keys = {name_lookup.get(returned.lower())}
+                keys.update(by_front.get(returned.split(" // ")[0].lower(), []))
+                for key in keys - {None}:
                     result[key] = card
                     matched_in_batch.add(key)
 
@@ -424,9 +456,9 @@ class ScryfallClient:
                     not_found.append(name)
                     not_found_set.add(name)
 
-        if not partial:
+        if not deferred:
             self._cache.set(cache_key, (result, not_found))
-        return result, not_found
+        return result, not_found, deferred
 
     async def get_card_price(self, name: str) -> dict:
         """Get pricing info for a card, finding a printing with prices if the default lacks them."""

@@ -1,7 +1,13 @@
 import asyncio
 import re
 import time
+import unicodedata
 from typing import Any
+
+
+_TRANSLIT = str.maketrans(
+    {"Æ": "Ae", "æ": "ae", "Œ": "Oe", "œ": "oe", "ß": "ss", "Ø": "O", "ø": "o"}
+)
 
 
 def to_slug(name: str) -> str:
@@ -10,8 +16,14 @@ def to_slug(name: str) -> str:
     Examples:
         "Atraxa, Praetors' Voice" -> "atraxa-praetors-voice"
         "Sol Ring" -> "sol-ring"
+        "Éowyn, Shieldmaiden" -> "eowyn-shieldmaiden"
         "Expansion // Explosion" -> "expansion-explosion"
     """
+    # "Éowyn" -> "Eowyn", "Jötun" -> "Jotun": EDHRec slugs are ASCII.
+    # NFKD doesn't decompose these, so map them explicitly.
+    name = name.translate(_TRANSLIT)
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
     slug = name.lower()
     slug = re.sub(r"['\",:.!?&]", "", slug)
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
@@ -93,3 +105,8 @@ class Cache:
         while len(self._store) > self._max_size:
             oldest_key = next(iter(self._store))
             del self._store[oldest_key]
+
+    def clear_prefix(self, prefix: str) -> None:
+        """Drop every entry whose key starts with ``prefix``."""
+        for key in [k for k in self._store if k.startswith(prefix)]:
+            del self._store[key]

@@ -279,3 +279,22 @@ async def test_bracket_handles_cancelled_child_result(monkeypatch):
     r = await server._bracket_report([], ["A"])
     assert "error" in r["game_changers"]
     assert r["minimum_bracket"] == 1
+
+
+@pytest.mark.asyncio
+async def test_collection_summary_reports_unresolved_and_pending(monkeypatch):
+    from mtg_commander_mcp import server
+
+    rows = [{"name": "Sol Ring", "quantity": 1}, {"name": "Jötun Grunt", "quantity": 2}]
+    monkeypatch.setattr(server, "_load_active", lambda: (rows, None))
+
+    async def fake(names, budget):
+        return {"Sol Ring": {"prices": {"usd": "1.50"}, "color_identity": []}}, ["Jötun Grunt"], []
+
+    monkeypatch.setattr(server.scryfall, "get_collection_budgeted", fake)
+    out = await server.collection_summary()
+    assert out["complete"] is True
+    assert out["unresolved_unique_cards"] == 1
+    assert out["unresolved_sample"] == ["Jötun Grunt"]
+    assert out["estimated_value_usd"] == 1.5
+    assert any("Unresolved" in n for n in out["notes"])

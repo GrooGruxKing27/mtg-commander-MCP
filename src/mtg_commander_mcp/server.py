@@ -1076,11 +1076,7 @@ async def price_deck(url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_rows(
-    rows: list[dict],
-    time_budget: float | None = None,
-    deferred: list[str] | None = None,
-) -> tuple[list[dict], dict, list[dict]]:
+async def _resolve_rows(rows: list[dict]) -> tuple[list[dict], dict, list[dict]]:
     """Run a parsed Delver CSV through Scryfall to canonicalize names
     and capture pricing data.
 
@@ -1098,9 +1094,7 @@ async def _resolve_rows(
 
     names = list({r["name"] for r in rows if r.get("name")})
     try:
-        scryfall_data, not_found = await scryfall.get_collection(
-            names, time_budget=time_budget, deferred=deferred
-        )
+        scryfall_data, not_found = await scryfall.get_collection(names)
     except ScryfallError as e:
         logger.warning("Scryfall batch resolve failed: %s", e)
         return [], {}, [{"row": r, "reason": str(e)} for r in rows]
@@ -1108,9 +1102,7 @@ async def _resolve_rows(
     # Per-card fuzzy fallback for misses. Bounded fan-out (matches
     # price_deck's pattern at server.py:752) so a heavily-misspelled
     # CSV doesn't burst Scryfall's per-IP limiter.
-    # Skipped under a time budget: hundreds of misses x per-card retries is
-    # exactly what blows the host timeout on big collections.
-    if not_found and time_budget is None:
+    if not_found:
         sem = asyncio.Semaphore(4)
 
         async def _one(n: str):
@@ -1144,7 +1136,7 @@ async def _resolve_rows(
 def _sum_collection_value(rows: list[dict], scryfall_data: dict) -> float:
     total = 0.0
     for r in rows:
-        sd = scryfall_data.get(r["name"])
+        sd = scryfall_data.get(r.get("name"))
         if not sd:
             continue
         usd = (sd.get("prices") or {}).get("usd")
@@ -1161,7 +1153,7 @@ def _color_breakdown(rows: list[dict], scryfall_data: dict) -> dict[str, int]:
     """Color identity histogram by total card quantity."""
     counts: dict[str, int] = {}
     for r in rows:
-        sd = scryfall_data.get(r["name"])
+        sd = scryfall_data.get(r.get("name"))
         if not sd:
             continue
         ci = sd.get("color_identity") or []
@@ -1282,31 +1274,39 @@ async def collection_summary(refresh: bool = False) -> dict:
     if err:
         return {"error": err}
 
-    # Re-resolve to get fresh Scryfall data (cached unless refresh=True
-    # ages out the entries — there's no per-call bypass yet, so
-    # `refresh` is a hint rather than a hard miss). The 5-minute TTL
-    # already keeps prices reasonably fresh.
+    # `refresh` drops cached collection lookups so prices are re-fetched.
     if refresh:
-        scryfall._cache._store.clear()
+        scryfall._cache.clear_prefix("collection")
 
     # A large collection (~10k cards) needs >100 Scryfall batches, more than
     # one MCP call can wait for. Resolve within a budget; repeat calls resume
-    # from the per-batch cache until `complete` is true.
-    deferred: list[str] = []
-    _, scryfall_data, _ = await _resolve_rows(
-        rows or [], time_budget=SUMMARY_TIME_BUDGET, deferred=deferred
-    )
+    # from the per-batch cache until `complete` is true. The per-card fuzzy
+    # fallback is skipped (hundreds of misses x retries would blow the
+    # deadline), so exact-match misses are reported as `unresolved` instead.
+    names = list({r["name"] for r in rows if r.get("name")})
+    try:
+        scryfall_data, not_found, deferred = await scryfall.get_collection_budgeted(
+            names, SUMMARY_TIME_BUDGET
+        )
+    except ScryfallError as e:
+        return {"error": f"Scryfall is rate-limiting or unreachable ({e}); "
+                         "wait a minute and retry."}
     pending = len(set(deferred))
-    if not scryfall_data and rows:
-        return {"error": "Scryfall is rate-limiting or unreachable; nothing resolved. "
-                         "Wait a minute and retry."}
+
+    notes = []
+    if pending:
+        notes.append("Scan not finished: value/color totals cover only resolved "
+                     "cards so far; call collection_summary again to continue.")
+    if not_found:
+        notes.append("Unresolved cards are excluded from value/color totals.")
 
     return {
         "complete": pending == 0,
         "pending_unique_cards": pending,
-        **({"note": "Value/color totals cover only resolved cards so far; "
-                    "call collection_summary again to continue."} if pending else {}),
-        "unique_cards": len({r["name"] for r in rows}),
+        "unresolved_unique_cards": len(not_found),
+        "unresolved_sample": sorted(not_found)[:10],
+        **({"notes": notes} if notes else {}),
+        "unique_cards": len(names),
         "total_quantity": sum(int(r.get("quantity", 1)) for r in rows),
         "estimated_value_usd": _sum_collection_value(rows, scryfall_data),
         "color_identity_breakdown": _color_breakdown(rows, scryfall_data),

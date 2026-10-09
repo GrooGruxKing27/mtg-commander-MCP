@@ -278,27 +278,98 @@ async def test_get_collection_retries_429(fake_sleep):
     assert handler.state["posts"] == 2  # 429 then success — previously fatal
 
 
-@pytest.mark.asyncio
-async def test_get_collection_time_budget_defers_and_resumes():
-    """A zero budget defers uncached batches; a repeat call resumes from the
-    per-batch cache instead of re-requesting what was already resolved."""
-    sc = ScryfallClient()
-    calls = []
-
+def _ok_handler(calls):
     def handler(request: httpx.Request) -> httpx.Response:
         idents = json.loads(request.content)["identifiers"]
         calls.append(len(idents))
         return httpx.Response(
             200, json={"data": [{"name": i["name"]} for i in idents], "not_found": []}
         )
+    return handler
 
-    install_transport(sc, handler)
+
+@pytest.mark.asyncio
+async def test_get_collection_time_budget_defers_and_resumes():
+    """A spent budget defers uncached batches; a repeat call resumes from the
+    per-batch cache instead of re-requesting what was already resolved."""
+    sc = ScryfallClient()
+    calls: list[int] = []
+    install_transport(sc, _ok_handler(calls))
     names = [f"Card {i:03d}" for i in range(160)]  # 3 batches of 75/75/10
 
-    deferred: list[str] = []
-    found, _ = await sc.get_collection(names, time_budget=-1, deferred=deferred)
+    found, _, deferred = await sc.get_collection_budgeted(names, time_budget=-1)
     assert found == {} and len(deferred) == 160 and calls == []
 
-    deferred = []
-    found, _ = await sc.get_collection(names, time_budget=100, deferred=deferred)
+    found, _, deferred = await sc.get_collection_budgeted(names, time_budget=100)
     assert len(found) == 160 and deferred == [] and calls == [75, 75, 10]
+
+
+@pytest.mark.asyncio
+async def test_get_collection_budgeted_keeps_progress_on_429():
+    """A rate-limit burst after some batches succeeded returns the partial
+    result with the rest deferred, rather than raising."""
+    sc = ScryfallClient()
+    sc.MAX_ATTEMPTS = 1
+    n = {"calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        n["calls"] += 1
+        if n["calls"] == 1:
+            idents = json.loads(request.content)["identifiers"]
+            return httpx.Response(
+                200, json={"data": [{"name": i["name"]} for i in idents], "not_found": []}
+            )
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    install_transport(sc, handler)
+    names = [f"Card {i:03d}" for i in range(160)]
+    found, _, deferred = await sc.get_collection_budgeted(names, time_budget=100)
+    assert len(found) == 75 and len(deferred) == 85
+
+
+@pytest.mark.asyncio
+async def test_get_collection_budgeted_raises_when_first_batch_fails():
+    sc = ScryfallClient()
+    sc.MAX_ATTEMPTS = 1
+    install_transport(sc, lambda r: httpx.Response(429, headers={"Retry-After": "0"}))
+    with pytest.raises(ScryfallError):
+        await sc.get_collection_budgeted(["Sol Ring"], time_budget=100)
+
+
+@pytest.mark.asyncio
+async def test_get_collection_budgeted_progress_counts_all_unmatched_batches():
+    """A succeeded batch that matched nothing is still progress."""
+    sc = ScryfallClient()
+    sc.MAX_ATTEMPTS = 1
+    n = {"calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        n["calls"] += 1
+        if n["calls"] == 1:
+            idents = json.loads(request.content)["identifiers"]
+            return httpx.Response(200, json={"data": [], "not_found": idents})
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    install_transport(sc, handler)
+    names = [f"Card {i:03d}" for i in range(160)]
+    found, not_found, deferred = await sc.get_collection_budgeted(names, time_budget=100)
+    assert found == {} and len(not_found) == 75 and len(deferred) == 85
+
+
+@pytest.mark.asyncio
+async def test_get_collection_sends_front_face_for_split_cards():
+    sc = ScryfallClient()
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        idents = json.loads(request.content)["identifiers"]
+        sent.extend(i["name"] for i in idents)
+        return httpx.Response(
+            200,
+            json={"data": [{"name": "Bedeck // Bedazzle"}], "not_found": []},
+        )
+
+    install_transport(sc, handler)
+    found, not_found = await sc.get_collection(["Bedeck // Bedazzle"])
+    assert sent == ["Bedeck"]
+    assert "Bedeck // Bedazzle" in found and not_found == []

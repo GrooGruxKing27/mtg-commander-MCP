@@ -90,3 +90,29 @@ async def test_discard_async_client_closes_in_background():
 def test_discard_async_client_without_loop_is_a_noop():
     # No running event loop (interpreter teardown path) — must not raise.
     discard_async_client(object())
+
+
+def test_to_slug_transliterates_diacritics():
+    from mtg_commander_mcp.utils import to_slug
+
+    assert to_slug("Éowyn, Shieldmaiden") == "eowyn-shieldmaiden"
+    assert to_slug("Jötun Grunt") == "jotun-grunt"
+    assert to_slug("Lim-Dûl the Necromancer") == "lim-dul-the-necromancer"
+
+
+def test_cache_clear_prefix():
+    from mtg_commander_mcp.utils import Cache
+
+    c = Cache()
+    c.set("collection:a", 1)
+    c.set("collection-batch:b", 2)
+    c.set("other", 3)
+    c.clear_prefix("collection")
+    assert c.get("collection:a") is None and c.get("collection-batch:b") is None
+    assert c.get("other") == 3
+
+
+def test_to_slug_ligatures():
+    from mtg_commander_mcp.utils import to_slug
+
+    assert to_slug("Æther Vial") == "aether-vial"
